@@ -143,6 +143,21 @@ const LOCATORS: &[&str] = &[
     "GetKeyedService",
 ];
 
+/// Container registrations: `services.AddScoped<IFoo, Foo>()` wires up
+/// every type it names.
+const REGISTRATIONS: &[&str] = &[
+    "AddScoped",
+    "AddSingleton",
+    "AddTransient",
+    "AddHostedService",
+    "AddKeyedScoped",
+    "AddKeyedSingleton",
+    "AddKeyedTransient",
+    "TryAddScoped",
+    "TryAddSingleton",
+    "TryAddTransient",
+];
+
 fn child_of_kind<'t>(node: &Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
     let found = node.children(&mut cursor).find(|c| c.kind() == kind);
@@ -726,10 +741,24 @@ impl<'s> CSharpParser<'s> {
         if !matches!(ctx.kind, "class" | "struct") {
             return vec![];
         }
+        self.injected_params(plist, false)
+    }
+
+    /// `marked_only`: just the parameters the container fills in a method
+    /// call (`[FromServices] T t` in an action, `[FromKeyedServices]`).
+    fn injected_params(&self, plist: Option<&Node>, marked_only: bool) -> Vec<FunctionCall> {
         let Some(plist) = plist else { return vec![] };
         children_of_kind(plist, "parameter")
             .into_iter()
             .filter_map(|p| {
+                if marked_only
+                    && !self
+                        .attributes(&p)
+                        .iter()
+                        .any(|a| matches!(attribute_name(a), "FromServices" | "FromKeyedServices"))
+                {
+                    return None;
+                }
                 let t = p.child_by_field_name("type")?;
                 if t.kind() == "predefined_type" {
                     return None;
@@ -918,6 +947,10 @@ impl<'s> CSharpParser<'s> {
             self.collect_locals(b, &mut scope);
         }
         let mut calls = extra_calls;
+        if kind == "method" {
+            let plist = node.child_by_field_name("parameters");
+            calls.extend(self.injected_params(plist.as_ref(), true));
+        }
         let mut seen = HashSet::new();
         for b in bodies {
             self.collect_calls(b, &scope, &mut calls, &mut seen, "unconditional");
@@ -1139,26 +1172,48 @@ impl<'s> CSharpParser<'s> {
             "cast_expression" => init
                 .child_by_field_name("type")
                 .map(|t| simple_type(self.text(&t))),
-            "invocation_expression" => {
-                let f = init.child_by_field_name("function")?;
-                let name = if f.kind() == "member_access_expression" {
-                    f.child_by_field_name("name")?
-                } else {
-                    f
-                };
-                if name.kind() != "generic_name" {
-                    return None;
-                }
-                let id = child_of_kind(&name, "identifier")?;
-                if !LOCATORS.contains(&self.text(&id)) {
-                    return None;
-                }
-                let args = child_of_kind(&name, "type_argument_list")?;
-                let arg = args.named_child(0)?;
-                Some(simple_type(self.text(&arg)))
-            }
+            "invocation_expression" => self.located_service(&init),
             _ => None,
         }
+    }
+
+    /// `sp.GetRequiredService<T>()` -> `T`.
+    fn located_service(&self, call: &Node) -> Option<String> {
+        let (method, args) = self.generic_call(call)?;
+        if !LOCATORS.contains(&method) {
+            return None;
+        }
+        args.into_iter().next()
+    }
+
+    /// Types a call resolves from or registers in the DI container.
+    fn services_named(&self, call: &Node) -> Vec<String> {
+        match self.generic_call(call) {
+            Some((m, args)) if REGISTRATIONS.contains(&m) => args,
+            Some((m, args)) if LOCATORS.contains(&m) => args.into_iter().take(1).collect(),
+            _ => vec![],
+        }
+    }
+
+    /// `x.M<A, B>(..)` -> (`M`, [`A`, `B`]).
+    fn generic_call(&self, call: &Node) -> Option<(&'s str, Vec<String>)> {
+        let f = call.child_by_field_name("function")?;
+        let name = if f.kind() == "member_access_expression" {
+            f.child_by_field_name("name")?
+        } else {
+            f
+        };
+        if name.kind() != "generic_name" {
+            return None;
+        }
+        let id = child_of_kind(&name, "identifier")?;
+        let list = child_of_kind(&name, "type_argument_list")?;
+        let mut c = list.walk();
+        let args = list
+            .named_children(&mut c)
+            .map(|a| simple_type(self.text(&a)))
+            .collect();
+        Some((self.text(&id), args))
     }
 
     fn declare(&self, scope: &mut Scope, name: Option<Node>, ty: Option<String>) {
@@ -1327,6 +1382,20 @@ impl<'s> CSharpParser<'s> {
             }
             _ => None,
         };
+        if node.kind() == "invocation_expression" {
+            for t in self.services_named(node) {
+                if seen.insert((t.clone(), line)) {
+                    out.push(FunctionCall {
+                        callee: t,
+                        defined_in: None,
+                        line,
+                        args: vec![],
+                        is_conditional: context != "unconditional",
+                        context: "inject".to_string(),
+                    });
+                }
+            }
+        }
         if let Some((callee, defined_in)) = target {
             if seen.insert((callee.clone(), line)) {
                 let args = node
@@ -1730,6 +1799,8 @@ public static class Ext { public static int Twice(this int x) => x * 2; }
                 // The receiver is a service-locator call: typed by its
                 // generic argument.
                 ("().MoveAsync", Some("IssueTransition")),
+                // ... and a use of the service, as an injection is.
+                ("IssueTransition", None),
                 ("sp.GetRequiredService", None),
                 ("new IssueTransition", None),
                 ("new IssueTransition", None),
@@ -1823,6 +1894,46 @@ public static class Ext { public static int Twice(this int x) => x * 2; }
                 "app.Run"
             ]
         );
+    }
+
+    #[test]
+    fn services_injected_into_constructors_actions_and_located() {
+        let fd = parse(
+            "AgentsController.cs",
+            "public class AgentsController(IssueTransition t, int retries) : ControllerBase {\n\
+             \x20 public AgentsController(AgentHandover h, string name) : this(null, 0) {}\n\
+             \x20 public Task ForIssue(string key, [FromServices] AgentHandover handover, Repo plain)\n\
+             \x20   => sp.GetService<IClock>().Now();\n\
+             \x20 static void Wire(IServiceCollection s) => s.AddScoped<IIssueService, IssueService>();\n}\n\
+             public record Dto(Issue Issue);\n",
+        );
+        let injected = |c: &Class, m: &str| -> Vec<String> {
+            method(c, m)
+                .calls
+                .iter()
+                .filter(|c| c.context == "inject")
+                .map(|c| c.callee.clone())
+                .collect()
+        };
+        let ctl = class(&fd, "AgentsController");
+        let ctors: Vec<Vec<String>> = ctl
+            .methods
+            .iter()
+            .filter(|m| m.name == "AgentsController")
+            .map(|m| {
+                m.calls
+                    .iter()
+                    .filter(|c| c.context == "inject")
+                    .map(|c| c.callee.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(ctors, vec![vec!["IssueTransition"], vec!["AgentHandover"]]);
+        // Only the `[FromServices]` parameter of an action is injected.
+        assert_eq!(injected(ctl, "ForIssue"), vec!["AgentHandover", "IClock"]);
+        assert!(injected(class(&fd, "Dto"), "Dto").is_empty());
+        // A registration names both the service and its implementation.
+        assert_eq!(injected(ctl, "Wire"), vec!["IIssueService", "IssueService"]);
     }
 
     #[test]
