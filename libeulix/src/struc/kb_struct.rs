@@ -299,7 +299,11 @@ pub struct CallGraphNode {
 pub struct CallGraphEdge {
     pub from: String,
     pub to: String,
-    pub edge_type: String, // "calls", "inherits", "uses"
+    /// "call", "inheritance" (subtype -> base), or (PRISM v2) "dispatch":
+    /// an interface / abstract / virtual method -> the same-named method of
+    /// a subtype implementing or overriding it, `call_site_line` being the
+    /// line of that implementation. A call through the interface runs it.
+    pub edge_type: String,
     pub conditional: bool,
     pub call_site_line: usize,
     /// Call edges only (PRISM v2), how the callee was pinned down:

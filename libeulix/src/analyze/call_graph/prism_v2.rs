@@ -35,20 +35,24 @@
 //! v2 also understands class hierarchies: `self.foo()` and
 //! `BaseClass.foo()` can be resolved through the inheritance chain rather
 //! than a name-only guess.
+//! A call through an interface or a base type still lands on the method
+//! the receiver is declared with; `dispatch` edges lead on from it to the
+//! implementations and overrides in subtypes.
 //!
 //! On a ~64k-file polyglot repo this runs in ~1.4s with ~3.1GB peak RSS,
 //! producing ~773k nodes and ~1.5M edges. That is the target profile.
 
 use crate::grammar_files::csharp::simple_type;
 use crate::struc::kb_struct::{
-    CallGraph, CallGraphEdge, CallGraphNode, CallerInfo, FileData, FunctionCall, KnowledgeBase,
-    Parameter,
+    CallGraph, CallGraphEdge, CallGraphNode, CallerInfo, Class, FileData, Function, FunctionCall,
+    KnowledgeBase, Parameter,
 };
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 type Map<K, V> = HashMap<K, V>;
@@ -65,6 +69,28 @@ const SELF_NAMES: [&str; 6] = ["self", "this", "cls", "_self", "self_", "myself"
 const MAX_CHAIN: usize = 64;
 const EDGE_CALL: u8 = 0;
 const EDGE_INHERIT: u8 = 1;
+/// Interface / abstract / virtual method -> the same-named method of an
+/// implementing or overriding type (see `dispatch_edges`).
+const EDGE_DISPATCH: u8 = 2;
+/// A call to this method may run a subtype's method of the same name:
+/// an interface member, `abstract` / `virtual` / `override`.
+const POLY_OPEN: u8 = 1;
+/// It may be the method a call through a base runs: `override`.
+const POLY_OVERRIDE: u8 = 2;
+/// A member of an interface.
+const POLY_IFACE: u8 = 4;
+/// Never dispatched to: static, or a constructor.
+const POLY_NONE: u8 = 8;
+/// A TypeScript interface member: a signature, reached through dispatch
+/// only. A by-name guess at it (`set.has(x)` -> `MarkStore.has`) would be
+/// one more wrong candidate for every untyped receiver call of that name.
+const POLY_SIG: u8 = 16;
+/// Cap on the implementations one interface / base method is linked to,
+/// nearest subtypes first. A plug-in point implemented in every module
+/// would otherwise add an edge per module to every one of its methods.
+const MAX_DISPATCH: usize = 32;
+/// Cap on the subtypes walked from one type when looking for overrides.
+const MAX_SUBTYPES: usize = 512;
 /// How many re-export hops (`__init__.py`, barrel `index.ts`) an import is
 /// followed through before giving up.
 const MAX_REEXPORT: u8 = 3;
@@ -202,6 +228,10 @@ struct Node<'a> {
     /// C# `partial` type: its namespace-qualified name. All parts of one
     /// type become a single node.
     partial: Option<&'a str>,
+    /// Methods: `POLY_*` flags — may a call to it run a subtype's method,
+    /// may it be such a method (see `method_poly`).
+    poly: u8,
+    line: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -315,6 +345,37 @@ fn first_self_param(params: &[Parameter]) -> bool {
         .first()
         .map(|p| SELF_NAMES.contains(&p.name.as_str()))
         .unwrap_or(false)
+}
+
+/// `POLY_*` flags of method `m` of type `class`. C# says what may be
+/// overridden (`abstract`, `virtual`, `override`, interface members); in the
+/// other languages any method may override and be overridden.
+fn method_poly(class: &Class, m: &Function) -> u8 {
+    let name = m.name.as_str();
+    if name == class.name || matches!(name, "constructor" | "__init__" | "__new__") {
+        return POLY_NONE;
+    }
+    let (Some(ci), Some(mi)) = (
+        class.lang_info.csharp.as_deref(),
+        m.lang_info.csharp.as_deref(),
+    ) else {
+        return POLY_OPEN | POLY_OVERRIDE;
+    };
+    let has = |x: &str| mi.modifiers.iter().any(|y| y == x);
+    if mi.is_static || has("static") || mi.kind == "constructor" {
+        return POLY_NONE;
+    }
+    let mut f = 0;
+    if ci.kind == "interface" {
+        f |= POLY_IFACE | POLY_OPEN;
+    }
+    if (has("abstract") || has("virtual") || has("override")) && !has("sealed") {
+        f |= POLY_OPEN;
+    }
+    if has("override") {
+        f |= POLY_OVERRIDE;
+    }
+    f
 }
 
 #[inline]
@@ -1099,6 +1160,68 @@ impl<'a> Resolver<'a> {
             .or_else(|| self.walk(class, name, &self.children))
     }
 
+    /// Dispatch edges: from every interface / abstract / virtual method to
+    /// the same-named method of each subtype that implements or overrides
+    /// it. A call lands on the method its receiver is declared with — an
+    /// `IIssueSearch` field reaches `IIssueSearch.Find` — and this is the
+    /// way on to `IssueSearch.Find`, which no call names.
+    ///
+    /// Only the nearest implementation down each branch is linked: an
+    /// override that is itself overridden carries its own edges further.
+    fn dispatch_edges(&self) -> Vec<RawEdge> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        let mut targets: Vec<u32> = Vec::new();
+        for &(class, name, m) in self.methods {
+            let src = &self.nodes[m as usize];
+            if src.poly & POLY_OPEN == 0 {
+                continue;
+            }
+            let Some(kids) = self.children.get(&class) else {
+                continue;
+            };
+            seen.clear();
+            queue.clear();
+            targets.clear();
+            seen.insert(class);
+            queue.extend(kids.iter().copied());
+            while let Some(c) = queue.pop_front() {
+                if seen.len() > MAX_SUBTYPES || !seen.insert(c) {
+                    continue;
+                }
+                if let Some(t) = self.own_method(c, name) {
+                    let tp = self.nodes[t as usize].poly;
+                    if tp & POLY_NONE == 0
+                        && (src.poly & POLY_IFACE != 0 || tp & POLY_OVERRIDE != 0)
+                    {
+                        if t != m && !targets.contains(&t) {
+                            targets.push(t);
+                        }
+                        if targets.len() >= MAX_DISPATCH {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if let Some(next) = self.children.get(&c) {
+                    queue.extend(next.iter().copied());
+                }
+            }
+            out.extend(targets.iter().map(|&t| RawEdge {
+                from: m,
+                to: t,
+                line: self.nodes[t as usize].line,
+                kind: EDGE_DISPATCH,
+                conditional: false,
+                via: Via::Local,
+            }));
+        }
+        out.sort_unstable_by_key(|e| (e.from, e.to));
+        out.dedup_by_key(|e| (e.from, e.to));
+        out
+    }
+
     fn resolve_call(
         &self,
         callee: &str,
@@ -1505,6 +1628,8 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                         owner: None,
                         is_ext: false,
                         partial: None,
+                        poly: POLY_NONE,
+                        line: func.line_start as u32,
                     });
                 }
                 for class in &fd.classes {
@@ -1522,6 +1647,8 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                             .as_ref()
                             .filter(|i| i.is_partial)
                             .and_then(|i| i.full_name.as_deref()),
+                        poly: 0,
+                        line: class.line_start as u32,
                     });
                     for base in &class.bases {
                         ex.bases.push(BaseRef {
@@ -1541,6 +1668,15 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                             owner: Some(&class.id),
                             is_ext: m.lang_info.csharp.as_ref().is_some_and(|i| i.is_extension),
                             partial: None,
+                            poly: method_poly(class, m)
+                                | if language_family(&fd.language) == 2
+                                    && class.id.starts_with("interface_")
+                                {
+                                    POLY_SIG
+                                } else {
+                                    0
+                                },
+                            line: m.line_start as u32,
                         });
                     }
                 }
@@ -1608,6 +1744,9 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
 
     let mut by_name: Map<&str, Vec<u32>> = Map::with_capacity(nodes.len());
     for (i, n) in nodes.iter().enumerate() {
+        if n.poly & POLY_SIG != 0 {
+            continue;
+        }
         by_name.entry(n.name).or_default().push(i as u32);
     }
     // Class-method index, sorted for binary search by (class, name).
@@ -1749,6 +1888,10 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
         })
         .collect();
 
+    // 4b. Interface / virtual dispatch, after the calls: an edge of its own
+    // kind, so every reader that follows calls is unchanged.
+    let dispatch = r.dispatch_edges();
+
     // 5. Materialise output.
     //
     // `call_count_estimate` is the number of *resolved* call edges that
@@ -1779,21 +1922,22 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
     let out_edges: Vec<CallGraphEdge> = inherit
         .par_iter()
         .chain(call_edges.par_iter())
+        .chain(dispatch.par_iter())
         .map(|e| CallGraphEdge {
             from: nodes[e.from as usize].id.to_string(),
             to: nodes[e.to as usize].id.to_string(),
-            edge_type: if e.kind == EDGE_INHERIT {
-                "inheritance"
-            } else {
-                "call"
+            edge_type: match e.kind {
+                EDGE_INHERIT => "inheritance",
+                EDGE_DISPATCH => "dispatch",
+                _ => "call",
             }
             .to_string(),
             conditional: e.conditional,
             call_site_line: e.line as usize,
-            resolution: if e.kind == EDGE_INHERIT {
-                String::new()
-            } else {
+            resolution: if e.kind == EDGE_CALL {
                 e.via.as_str().to_string()
+            } else {
+                String::new()
             },
         })
         .collect();

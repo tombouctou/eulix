@@ -3,16 +3,25 @@
 
 use libeulix::struc::kb_struct::*;
 
+/// Modifiers PRISM v2 reads to link an interface / virtual method to its
+/// implementations and overrides.
+const DISPATCH_MODIFIERS: [&str; 5] = ["abstract", "virtual", "override", "sealed", "static"];
+
 /// The part of `CSharpInfo` the analysis still reads once a file is parsed:
 /// PRISM v2 merges partial types by `full_name`, resolves `using` through
-/// `namespace` and extension calls through `is_extension`; entry points read
-/// `route` / `http_methods`.
+/// `namespace` and extension calls through `is_extension`, dispatch through
+/// `kind` and the override modifiers; entry points read `route` /
+/// `http_methods`.
 fn slim_csharp(info: &mut LanguageSpecificInfo) {
     let kept = info.csharp.take().map(|c| {
+        let mut modifiers = c.modifiers;
+        modifiers.retain(|m| DISPATCH_MODIFIERS.contains(&m.as_str()));
         Box::new(CSharpInfo {
             namespace: c.namespace,
             full_name: c.full_name,
             kind: c.kind,
+            modifiers,
+            is_static: c.is_static,
             is_partial: c.is_partial,
             is_extension: c.is_extension,
             route: c.route,
@@ -137,6 +146,35 @@ mod tests {
         assert!(run.calls[0].args.is_empty());
         let ctor = c.methods.iter().find(|m| m.name == "Svc").expect("ctor");
         assert_eq!(ctor.calls[0].context, "inject");
+    }
+
+    #[test]
+    fn csharp_keeps_the_modifiers_dispatch_reads() {
+        let fd = parsed(
+            "Base.cs",
+            "namespace A;\npublic abstract class Base {\n\
+             \x20 protected internal abstract Task Run();\n\
+             \x20 public static async void Make() {}\n}\n",
+        );
+        let mods = |name: &str| {
+            let m = fd.classes[0].methods.iter().find(|m| m.name == name);
+            m.and_then(|m| m.lang_info.csharp.as_deref())
+                .map(|i| (i.modifiers.clone(), i.is_static, i.access_modifier.clone()))
+        };
+        assert_eq!(
+            mods("Run"),
+            Some((vec!["abstract".to_string()], false, None))
+        );
+        assert_eq!(mods("Make"), Some((vec!["static".to_string()], true, None)));
+        let class = fd.classes[0]
+            .lang_info
+            .csharp
+            .as_deref()
+            .map(|i| (i.kind.clone(), i.modifiers.clone()));
+        assert_eq!(
+            class,
+            Some(("class".to_string(), vec!["abstract".to_string()]))
+        );
     }
 
     #[test]

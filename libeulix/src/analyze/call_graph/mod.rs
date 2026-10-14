@@ -694,4 +694,206 @@ mod tests {
             vec!["interface_ILegalStore::src/Pm.Api/Data/ILegalStore.cs"]
         );
     }
+
+    // ───────────── interface / virtual dispatch ─────────────
+
+    /// `(from, to)` of every dispatch edge, sorted.
+    fn dispatch_of(g: &CallGraph) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = g
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "dispatch")
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn pair(from: &str, to: &str) -> (String, String) {
+        (from.to_string(), to.to_string())
+    }
+
+    const I_FIND: &str = "method_IIssueSearch_Find::src/Svc/IIssueSearch.cs";
+    const FIND: &str = "method_IssueSearch_Find::src/Svc/IssueSearch.cs";
+    const CACHED_FIND: &str = "method_CachedSearch_Find::src/Svc/CachedSearch.cs";
+    const HOST_DESCRIBE: &str = "method_RepoHostClient_Describe::src/Svc/RepoHostClient.cs";
+    const GITLAB_DESCRIBE: &str = "method_GitLabClient_Describe::src/Svc/GitLabClient.cs";
+
+    fn csharp_dispatch_project() -> HashMap<String, FileData> {
+        project(&[
+            (
+                "src/Svc/IIssueSearch.cs",
+                "namespace Svc;\npublic interface IIssueSearch {\n\
+                 \x20 Task Find(string q);\n\
+                 \x20 static IIssueSearch Make() => null;\n}\n",
+            ),
+            (
+                "src/Svc/IssueSearch.cs",
+                "namespace Svc;\npublic class IssueSearch : IIssueSearch {\n\
+                 \x20 public IssueSearch() {}\n\
+                 \x20 public virtual Task Find(string q) => Task.CompletedTask;\n\
+                 \x20 public void Helper() {}\n}\n",
+            ),
+            (
+                "src/Svc/CachedSearch.cs",
+                "namespace Svc;\npublic class CachedSearch : IssueSearch {\n\
+                 \x20 public override Task Find(string q) => base.Find(q);\n\
+                 \x20 public void Helper() {}\n}\n",
+            ),
+            (
+                "src/Svc/ShadowSearch.cs",
+                "namespace Svc;\npublic class ShadowSearch : CachedSearch {\n\
+                 \x20 public new Task Find(string q) => Task.CompletedTask;\n}\n",
+            ),
+            (
+                "src/Svc/RepoHostClient.cs",
+                "namespace Svc;\npublic abstract class RepoHostClient {\n\
+                 \x20 public abstract void Describe();\n\
+                 \x20 protected void Log() {}\n}\n",
+            ),
+            (
+                "src/Svc/GitLabClient.cs",
+                "namespace Svc;\npublic sealed class GitLabClient : RepoHostClient {\n\
+                 \x20 public override void Describe() { Log(); }\n\
+                 \x20 public new void Log() {}\n}\n",
+            ),
+            (
+                "src/Web/SearchController.cs",
+                "using Svc;\nnamespace Web;\npublic class SearchController(IIssueSearch search) {\n\
+                 \x20 public Task Get() => search.Find(\"x\");\n}\n",
+            ),
+        ])
+    }
+
+    #[test]
+    fn csharp_interface_and_virtual_methods_dispatch_to_implementations() {
+        let g = build_call_graph_v2(&csharp_dispatch_project());
+        // The interface member reaches the class implementing it, the
+        // virtual method its override; `new` hides rather than overrides, a
+        // non-virtual `Helper` / `Log` and a static interface member
+        // dispatch nowhere, and constructors are never targets.
+        assert_eq!(
+            dispatch_of(&g),
+            vec![
+                pair(I_FIND, FIND),
+                pair(FIND, CACHED_FIND),
+                pair(HOST_DESCRIBE, GITLAB_DESCRIBE),
+            ]
+        );
+        // The call itself still lands on the interface method, and only
+        // there: dispatch edges are not calls.
+        assert_eq!(
+            calls_of(
+                &g,
+                "method_SearchController_Get::src/Web/SearchController.cs"
+            ),
+            vec![edge(I_FIND, "import")]
+        );
+        let find = g
+            .nodes
+            .iter()
+            .find(|n| n.id == FIND)
+            .map(|n| n.call_count_estimate);
+        assert_eq!(find, Some(1), "base.Find() from the override only");
+    }
+
+    #[test]
+    fn dispatch_needs_only_what_slim_keeps() {
+        // The parser binary hands PRISM v2 slimmed files (eulix-parser
+        // `slim`): of the modifiers, only the ones deciding dispatch.
+        let mut files = csharp_dispatch_project();
+        for fd in files.values_mut() {
+            for c in &mut fd.classes {
+                for m in &mut c.methods {
+                    if let Some(i) = m.lang_info.csharp.as_mut() {
+                        i.modifiers.retain(|x| {
+                            matches!(
+                                x.as_str(),
+                                "abstract" | "virtual" | "override" | "sealed" | "static"
+                            )
+                        });
+                        i.attributes.clear();
+                        i.access_modifier = None;
+                    }
+                }
+            }
+        }
+        assert_eq!(dispatch_of(&build_call_graph_v2(&files)).len(), 3);
+    }
+
+    #[test]
+    fn ts_and_java_implementations_get_dispatch_edges() {
+        let g = build_call_graph_v2(&project(&[
+            (
+                "web/store.ts",
+                "export interface Store { get(k: string): string; }\n\
+                 export abstract class Base { abstract put(k: string): void; }\n",
+            ),
+            (
+                "web/mem.ts",
+                "import { Store, Base } from './store';\n\
+                 export class MemStore extends Base implements Store {\n\
+                 \x20 get(k: string) { return k; }\n\
+                 \x20 put(k: string) {}\n\
+                 \x20 constructor() { super(); }\n}\n",
+            ),
+            (
+                "src/main/java/a/Repo.java",
+                "package a;\npublic interface Repo { void save(); }\n",
+            ),
+            (
+                "src/main/java/a/JpaRepo.java",
+                "package a;\npublic class JpaRepo implements Repo { public void save() {} }\n",
+            ),
+            (
+                "web/use.ts",
+                "export function use(s: any) { return s.get('k'); }\n",
+            ),
+        ]));
+        // An untyped `s.get()` is a by-name guess at the one method with a
+        // body, never at the interface's signature.
+        assert_eq!(
+            calls_of(&g, "func_use::web/use.ts"),
+            vec![edge("method_MemStore_get::web/mem.ts", "name")]
+        );
+        let d = dispatch_of(&g);
+        let short: Vec<(String, String)> = d
+            .iter()
+            .map(|(f, t)| {
+                let s = |x: &str| x.split("::").next().unwrap_or(x).to_string();
+                (s(f), s(t))
+            })
+            .collect();
+        assert_eq!(
+            short,
+            vec![
+                pair("method_Base_put", "method_MemStore_put"),
+                pair("method_Repo_save", "method_JpaRepo_save"),
+                pair("method_Store_get", "method_MemStore_get"),
+            ],
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_fan_out_is_capped() {
+        let mut files: Vec<(String, String)> = vec![(
+            "src/P/IPlugin.cs".to_string(),
+            "namespace P;\npublic interface IPlugin { void Run(); }\n".to_string(),
+        )];
+        for i in 0..40 {
+            files.push((
+                format!("src/P/Plugin{i}.cs"),
+                format!(
+                    "namespace P;\npublic class Plugin{i} : IPlugin {{ public void Run() {{}} }}\n"
+                ),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let g = build_call_graph_v2(&project(&refs));
+        assert_eq!(dispatch_of(&g).len(), 32);
+    }
 }
