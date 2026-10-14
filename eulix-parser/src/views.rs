@@ -17,7 +17,7 @@ pub struct ClassSimpleView<'a>(pub &'a Class);
 impl<'a> Serialize for FunctionSimpleView<'a> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let f = self.0;
-        let mut st = s.serialize_struct("FunctionSimple", 8)?;
+        let mut st = s.serialize_struct("FunctionSimple", 9)?;
         st.serialize_field("id", &f.id)?;
         st.serialize_field("name", &f.name)?;
         st.serialize_field("signature", &f.signature)?;
@@ -26,6 +26,13 @@ impl<'a> Serialize for FunctionSimpleView<'a> {
         st.serialize_field("docstring", &f.docstring)?;
         st.serialize_field("line_start", &f.line_start)?;
         st.serialize_field("line_end", &f.line_end)?;
+        // Decorators / attributes are how a route or a test is found:
+        // `[HttpGet("{id}")]`, `[Fact]`, `@app.get("/x")`.
+        if f.decorators.is_empty() {
+            st.skip_field("decorators")?;
+        } else {
+            st.serialize_field("decorators", &f.decorators)?;
+        }
         // st.serialize_field("tags", &f.tags)?;
         // "complexity" removed
         // "importance_score" removed

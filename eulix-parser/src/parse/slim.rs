@@ -3,15 +3,46 @@
 
 use libeulix::struc::kb_struct::*;
 
-pub fn strip_fn(f: &mut Function) {
+/// The part of `CSharpInfo` the analysis still reads once a file is parsed:
+/// PRISM v2 merges partial types by `full_name`, resolves `using` through
+/// `namespace` and extension calls through `is_extension`; entry points read
+/// `route` / `http_methods`.
+fn slim_csharp(info: &mut LanguageSpecificInfo) {
+    let kept = info.csharp.take().map(|c| {
+        Box::new(CSharpInfo {
+            namespace: c.namespace,
+            full_name: c.full_name,
+            kind: c.kind,
+            is_partial: c.is_partial,
+            is_extension: c.is_extension,
+            route: c.route,
+            http_methods: c.http_methods,
+            ..Default::default()
+        })
+    });
+    *info = LanguageSpecificInfo {
+        csharp: kept,
+        ..Default::default()
+    };
+}
+
+/// `keep_receivers`: C# calls carry the receiver's declared type in
+/// `defined_in` and constructor injection in `context`; PRISM v2 reads both.
+pub fn strip_fn(f: &mut Function, keep_receivers: bool) {
     f.control_flow = ControlFlow::default();
     f.exceptions = ExceptionInfo::default();
-    f.lang_info = LanguageSpecificInfo::default();
+    if keep_receivers {
+        slim_csharp(&mut f.lang_info);
+    } else {
+        f.lang_info = LanguageSpecificInfo::default();
+    }
     f.called_by = Vec::new();
     for c in &mut f.calls {
         c.args = Vec::new();
-        c.context = String::new();
-        c.defined_in = None;
+        if !keep_receivers {
+            c.context = String::new();
+            c.defined_in = None;
+        }
     }
     f.calls.shrink_to_fit();
 }
@@ -24,27 +55,99 @@ pub fn strip_emitted(fd: &mut FileData) {
         f.params.truncate(1); // analyzer only reads params[0] (self detection)
         f.params.shrink_to_fit();
     }
+    let csharp = fd.language == "csharp";
     fd.todos = Vec::new();
     fd.functions.iter_mut().for_each(strip_fn);
     for c in &mut fd.classes {
-        c.attributes = Vec::new();
-        c.lang_info = LanguageSpecificInfo::default();
+        if csharp {
+            // Member types (`_db: AppDbContext`) type the receivers of calls.
+            for a in &mut c.attributes {
+                a.value = None;
+            }
+            slim_csharp(&mut c.lang_info);
+        } else {
+            c.attributes = Vec::new();
+            c.lang_info = LanguageSpecificInfo::default();
+        }
         c.methods.iter_mut().for_each(strip_fn);
     }
 }
 
 pub fn slim(fd: &mut FileData) {
+    let csharp = fd.language == "csharp";
     fd.global_vars = Vec::new();
     fd.security_notes = Vec::new();
     // Imports stay: PRISM v2 resolves calls through them. Dropping them here
     // left every call to be matched by bare name. They are small next to the
     // functions, and kb.json does not carry them (see views.rs).
     fd.imports.shrink_to_fit();
-    fd.functions.iter_mut().for_each(strip_fn);
+    fd.functions.iter_mut().for_each(|f| strip_fn(f, csharp));
     for c in &mut fd.classes {
-        c.methods.iter_mut().for_each(strip_fn);
+        c.methods.iter_mut().for_each(|f| strip_fn(f, csharp));
         c.methods.shrink_to_fit();
     }
     fd.functions.shrink_to_fit();
     fd.classes.shrink_to_fit();
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use std::path::Path;
+
+    fn parsed(path: &str, src: &str) -> FileData {
+        let (_, mut fd) =
+            libeulix::grammar_files::parse_source(Path::new(path), src).expect("fixture parses");
+        slim(&mut fd);
+        strip_emitted(&mut fd);
+        fd
+    }
+
+    #[test]
+    fn csharp_keeps_what_prism_v2_reads() {
+        let fd = parsed(
+            "Svc.cs",
+            "namespace A;\npublic partial class Svc(Repo repo) {\n\
+             \x20 private readonly Clock _clock = new();\n\
+             \x20 public void Run(Repo r) { r.Save(); }\n}\n",
+        );
+        let c = &fd.classes[0];
+        let info = c.lang_info.csharp.as_deref().expect("type info kept");
+        assert_eq!(info.full_name.as_deref(), Some("A.Svc"));
+        assert!(info.is_partial);
+        let members: Vec<(&str, &str, bool)> = c
+            .attributes
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_str(),
+                    a.type_annotation.as_str(),
+                    a.value.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            members,
+            vec![("repo", "Repo", false), ("_clock", "Clock", false)]
+        );
+        let run = c.methods.iter().find(|m| m.name == "Run").expect("Run");
+        assert_eq!(run.calls[0].defined_in.as_deref(), Some("Repo"));
+        assert!(run.calls[0].args.is_empty());
+        let ctor = c.methods.iter().find(|m| m.name == "Svc").expect("ctor");
+        assert_eq!(ctor.calls[0].context, "inject");
+    }
+
+    #[test]
+    fn other_languages_are_slimmed_as_before() {
+        let fd = parsed(
+            "a.py",
+            "class A:\n    x: int = 1\n    def f(self, o):\n        o.g(1)\n",
+        );
+        let c = &fd.classes[0];
+        assert!(c.attributes.is_empty());
+        assert!(c.methods[0].calls[0].defined_in.is_none());
+        assert!(c.methods[0].calls[0].context.is_empty());
+    }
 }
