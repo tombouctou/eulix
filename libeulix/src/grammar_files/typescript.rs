@@ -496,7 +496,7 @@ impl TypeScriptParser {
 
         for child in root.children(&mut cursor) {
             match child.kind() {
-                "class_declaration" => {
+                "class_declaration" | "abstract_class_declaration" => {
                     if let Some(class) = self.parse_class(&child) {
                         classes.push(class);
                     }
@@ -510,7 +510,7 @@ impl TypeScriptParser {
                     let mut ec = child.walk();
                     for inner in child.children(&mut ec) {
                         match inner.kind() {
-                            "class_declaration" => {
+                            "class_declaration" | "abstract_class_declaration" => {
                                 if let Some(class) = self.parse_class(&inner) {
                                     classes.push(class);
                                 }
@@ -600,6 +600,19 @@ impl TypeScriptParser {
             })
             .collect();
 
+        // Method signatures: a call through the interface names them, and
+        // dispatch leads on from them to the implementing classes.
+        let methods: Vec<Function> = node
+            .child_by_field_name("body")
+            .map(|body| {
+                let mut cursor = body.walk();
+                body.children(&mut cursor)
+                    .filter(|c| c.kind() == "method_signature")
+                    .filter_map(|c| self.parse_method(&c, &name))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let attributes: Vec<Attribute> = node
             .child_by_field_name("body")
             .map(|body| {
@@ -629,13 +642,13 @@ impl TypeScriptParser {
             .unwrap_or_default();
 
         Some(Class {
-            id: format!("interface_{}", name),
+            id: format!("interface_{}::{}", name, self.file_path),
             name,
             bases,
             docstring,
             line_start,
             line_end,
-            methods: vec![],
+            methods,
             attributes,
             decorators: vec![],
             lang_info: LanguageSpecificInfo::default(),
@@ -669,7 +682,9 @@ impl TypeScriptParser {
                         });
                     }
                 }
-                "method_definition" => {
+                // An abstract method has no body; it is still the method a
+                // call through the base class names.
+                "method_definition" | "abstract_method_signature" => {
                     if let Some(method) = self.parse_method(&child, class_name) {
                         methods.push(method);
                     }
