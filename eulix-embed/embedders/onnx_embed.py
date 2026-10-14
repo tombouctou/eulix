@@ -81,8 +81,8 @@ def _resolve_providers(ort: Any, device: str | None) -> tuple[list[str], str]:
     batch-size / bucketing heuristics.
 
     When `device` is None, auto-detects the best provider actually present in
-    `ort.get_available_providers()` — CUDA, ROCm/MIGraphX, CoreML (MPS), then
-    CPU.
+    `ort.get_available_providers()` — CUDA, ROCm/MIGraphX, then CPU. CoreML is
+    used only when asked for explicitly (see the note at the auto-detection).
     """
     available = set(ort.get_available_providers())
 
@@ -144,12 +144,18 @@ def _resolve_providers(ort: Any, device: str | None) -> tuple[list[str], str]:
         )
         return ["MIGraphXExecutionProvider", "CPUExecutionProvider"], "rocm"
 
+    # CoreML is deliberately NOT auto-selected: with the dynamic sequence
+    # lengths of code chunks it recompiles the model per input shape, which
+    # measured ~3-5 s per chunk on Apple Silicon (bge-base, 3143 chunks:
+    # hours) against ~9 chunks/s on CPUExecutionProvider. Pass --device mps
+    # (or coreml) to opt in anyway.
     if "CoreMLExecutionProvider" in available:
         print(
-            "  ✓ Apple Silicon / macOS GPU detected — using CoreMLExecutionProvider",
+            "ℹ CoreMLExecutionProvider available but slow for variable-length "
+            "chunks — using CPUExecutionProvider (pass --device mps to override)",
             file=sys.stderr,
         )
-        return ["CoreMLExecutionProvider", "CPUExecutionProvider"], "mps"
+        return ["CPUExecutionProvider"], "cpu"
 
     print(
         "ℹ No GPU execution provider available — using CPUExecutionProvider",
