@@ -491,4 +491,207 @@ mod tests {
             ]
         );
     }
+
+    // ─────────────────────────────── C# ───────────────────────────────
+
+    const CS_MOVE: &str =
+        "method_IssueTransition_MoveAsync::src/Pm.Api/Services/IssueTransition.cs";
+    const CS_TRANSITION: &str = "class_IssueTransition::src/Pm.Api/Services/IssueTransition.cs";
+    const CS_OTHER_MOVE: &str = "method_Other_MoveAsync::src/Pm.Api/Services/Other.cs";
+    const CS_DB: &str = "class_AppDbContext::src/Pm.Api/Data/AppDbContext.cs";
+    const CS_SAVE: &str = "method_AppDbContext_SaveAsync::src/Pm.Api/Data/AppDbContext.cs";
+    const CS_IS_DONE: &str = "method_IssueExtensions_IsDone::src/Pm.Api/Util/Extensions.cs";
+
+    /// Two `IssueTransition`s in two namespaces, a `MoveAsync` in an
+    /// unrelated class, a partial `AppDbContext` over two files, a base
+    /// controller, an extension method.
+    fn csharp_project() -> HashMap<String, FileData> {
+        project(&[
+            (
+                "src/Pm.Api/Services/IssueTransition.cs",
+                "using Pm.Api.Data;\nnamespace Pm.Api.Services;\n\
+                 public sealed class IssueTransition(AppDbContext db) {\n\
+                 \x20 public async Task<bool> MoveAsync(int id) { await db.SaveAsync(); return true; }\n\
+                 \x20 public Task ToAsync() => MoveAsync(1);\n}\n",
+            ),
+            (
+                "src/Pm.Api/Services/Other.cs",
+                "namespace Pm.Api.Services;\npublic class Other {\n\
+                 \x20 public void MoveAsync() {}\n\
+                 \x20 public override string ToString() => \"other\";\n}\n",
+            ),
+            (
+                "src/Pm.Legacy/IssueTransition.cs",
+                "namespace Pm.Legacy;\npublic class IssueTransition { public void MoveAsync(int id) {} }\n",
+            ),
+            (
+                "src/Pm.Api/Data/AppDbContext.cs",
+                "namespace Pm.Api.Data;\npublic partial class AppDbContext : DbContext {\n\
+                 \x20 public Task SaveAsync() => Task.CompletedTask;\n}\n",
+            ),
+            (
+                "src/Pm.Api/Data/AppDbContext.Legal.cs",
+                "namespace Pm.Api.Data;\npublic partial class AppDbContext : ILegalStore {\n\
+                 \x20 public void Legal() { SaveAsync(); }\n}\n",
+            ),
+            (
+                "src/Pm.Api/Data/ILegalStore.cs",
+                "namespace Pm.Api.Data;\npublic interface ILegalStore { void Legal(); }\n",
+            ),
+            (
+                "src/Pm.Api/Controllers/ApiControllerBase.cs",
+                "namespace Pm.Api.Controllers;\n\
+                 public abstract class ApiControllerBase : ControllerBase { protected void Ok() {} }\n",
+            ),
+            (
+                "src/Pm.Api/Controllers/IssuesController.cs",
+                "using Pm.Api.Services;\nnamespace Pm.Api.Controllers;\n[Route(\"api\")]\n\
+                 public class IssuesController(IssueTransition transition) : ApiControllerBase {\n\
+                 \x20 private readonly Other _other;\n\
+                 \x20 [HttpPost(\"move\")]\n\
+                 \x20 public async Task Move() {\n\
+                 \x20   await transition.MoveAsync(1);\n\
+                 \x20   this._other.MoveAsync();\n\
+                 \x20   Ok();\n\
+                 \x20   Math.Max(1, 2);\n\
+                 \x20   unknown.Frobnicate();\n\
+                 \x20 }\n}\n",
+            ),
+            (
+                "src/Pm.Api/Util/Extensions.cs",
+                "namespace Pm.Api.Util;\n\
+                 public static class IssueExtensions {\n\
+                 \x20 public static bool IsDone(this Issue i) => true;\n\
+                 \x20 public static bool Done(this IQueryable<Issue> q) => true;\n}\n",
+            ),
+            (
+                "tests/Pm.Tests/MoveTests.cs",
+                "using Pm.Api.Services;\nusing Pm.Api.Util;\nnamespace Pm.Tests;\n\
+                 public class MoveTests {\n\
+                 \x20 [Fact]\n\
+                 \x20 public async Task Moves() {\n\
+                 \x20   var t = new IssueTransition(null);\n\
+                 \x20   await t.MoveAsync(1);\n\
+                 \x20   Issue issue = Load();\n\
+                 \x20   issue.IsDone();\n\
+                 \x20   var loose = Load();\n\
+                 \x20   loose.MoveAsync();\n\
+                 \x20   loose.ToString();\n\
+                 \x20   loose.Items.Done();\n\
+                 \x20 }\n}\n",
+            ),
+        ])
+    }
+
+    #[test]
+    fn csharp_calls_resolve_through_receiver_types_and_namespaces() {
+        let g = build_call_graph_v2(&csharp_project());
+        // `transition` is a primary constructor parameter, `_other` a field;
+        // `IssueTransition` is the one the `using` brings in, not Pm.Legacy's.
+        // `Ok()` is inherited from the project's base controller; `Math.Max`
+        // is outside the project and `unknown.Frobnicate` defined nowhere.
+        assert_eq!(
+            calls_of(
+                &g,
+                "method_IssuesController_Move::src/Pm.Api/Controllers/IssuesController.cs"
+            ),
+            vec![
+                edge(
+                    "method_ApiControllerBase_Ok::src/Pm.Api/Controllers/ApiControllerBase.cs",
+                    "local"
+                ),
+                edge(CS_MOVE, "import"),
+                edge(CS_OTHER_MOVE, "import"),
+            ]
+        );
+        // `var t = new IssueTransition(..)` types `t`; `Issue` is not a
+        // project type, so `issue.IsDone()` can only be the extension method
+        // the file's `using` brings in. `loose` is of unknown type: its
+        // `MoveAsync` is any of the three, flagged as a guess (the one `t`
+        // already reaches keeps its tighter `import` edge), and its
+        // `ToString()` is not guessed at all: that is `object.ToString`
+        // far more often than the project's only override. `loose.Items`
+        // is untyped too, but the only `Done` is an extension method the
+        // `using` brings in.
+        let mut moves = calls_of(&g, "method_MoveTests_Moves::tests/Pm.Tests/MoveTests.cs");
+        moves.retain(|(_, how)| how != "ambiguous");
+        assert_eq!(
+            moves,
+            vec![
+                edge(CS_TRANSITION, "import"),
+                edge(
+                    "method_IssueExtensions_Done::src/Pm.Api/Util/Extensions.cs",
+                    "import"
+                ),
+                edge(CS_IS_DONE, "import"),
+                edge(CS_MOVE, "import"),
+            ]
+        );
+        let guessed = calls_of(&g, "method_MoveTests_Moves::tests/Pm.Tests/MoveTests.cs")
+            .into_iter()
+            .filter(|(_, how)| how == "ambiguous")
+            .count();
+        assert_eq!(guessed, 2);
+        // Same class (`MoveAsync` from `ToAsync`), and a primary constructor
+        // parameter of a type from another namespace.
+        assert_eq!(
+            calls_of(
+                &g,
+                "method_IssueTransition_ToAsync::src/Pm.Api/Services/IssueTransition.cs"
+            ),
+            vec![edge(CS_MOVE, "local")]
+        );
+        assert_eq!(calls_of(&g, CS_MOVE), vec![edge(CS_SAVE, "import")]);
+    }
+
+    #[test]
+    fn csharp_constructor_parameters_are_uses_of_the_service() {
+        let g = build_call_graph_v2(&csharp_project());
+        assert_eq!(
+            calls_of(
+                &g,
+                "method_IssuesController_IssuesController::src/Pm.Api/Controllers/IssuesController.cs"
+            ),
+            vec![edge(CS_TRANSITION, "import")]
+        );
+        assert_eq!(
+            calls_of(
+                &g,
+                "method_IssueTransition_IssueTransition::src/Pm.Api/Services/IssueTransition.cs"
+            ),
+            vec![edge(CS_DB, "import")]
+        );
+    }
+
+    #[test]
+    fn csharp_partial_class_is_one_node() {
+        let g = build_call_graph_v2(&csharp_project());
+        let parts: Vec<&str> = g
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == "class" && n.id.starts_with("class_AppDbContext::"))
+            .map(|n| n.id.as_str())
+            .collect();
+        // The part in AppDbContext.cs, though AppDbContext.Legal.cs sorts first.
+        assert_eq!(parts, vec![CS_DB]);
+        // A method of one part calls a method of the other as its own.
+        assert_eq!(
+            calls_of(
+                &g,
+                "method_AppDbContext_Legal::src/Pm.Api/Data/AppDbContext.Legal.cs"
+            ),
+            vec![edge(CS_SAVE, "local")]
+        );
+        // Bases declared on either part belong to the one node.
+        let bases: Vec<&str> = g
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "inheritance" && e.from == CS_DB)
+            .map(|e| e.to.as_str())
+            .collect();
+        assert_eq!(
+            bases,
+            vec!["interface_ILegalStore::src/Pm.Api/Data/ILegalStore.cs"]
+        );
+    }
 }

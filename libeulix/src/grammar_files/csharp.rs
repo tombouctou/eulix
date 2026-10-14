@@ -1128,11 +1128,10 @@ impl<'s> CSharpParser<'s> {
 
     /// Type of `var x = <init>` when the initializer names it.
     fn inferred_type(&self, init: &Node) -> Option<String> {
-        let init = if init.kind() == "await_expression" {
-            init.named_child(0)?
-        } else {
-            *init
-        };
+        let mut init = *init;
+        while matches!(init.kind(), "await_expression" | "parenthesized_expression") {
+            init = init.named_child(0)?;
+        }
         match init.kind() {
             "object_creation_expression" => init
                 .child_by_field_name("type")
@@ -1247,7 +1246,8 @@ impl<'s> CSharpParser<'s> {
                     ("()".to_string(), None)
                 }
             }
-            _ => ("()".to_string(), None),
+            // `new T(..).F()`, `sp.GetRequiredService<T>().F()`, `((T)x).F()`.
+            _ => ("()".to_string(), self.inferred_type(expr)),
         }
     }
 
@@ -1611,6 +1611,7 @@ public sealed partial class IssuesController(IssueTransition transition, ILogger
     public async Task<IActionResult> Move(string key, CancellationToken ct = default)
     {
         var issue = await _db.Issues.FindAsync(key);
+        await sp.GetRequiredService<IssueTransition>().MoveAsync(issue, ct);
         var other = new IssueTransition(_db);
         IssueTransition typed = new(_db);
         await transition.MoveAsync(issue, ct);
@@ -1726,6 +1727,10 @@ public static class Ext { public static int Twice(this int x) => x * 2; }
             calls(mv),
             vec![
                 ("_db.Issues.FindAsync", None),
+                // The receiver is a service-locator call: typed by its
+                // generic argument.
+                ("().MoveAsync", Some("IssueTransition")),
+                ("sp.GetRequiredService", None),
                 ("new IssueTransition", None),
                 ("new IssueTransition", None),
                 // A primary constructor parameter is not a local: the

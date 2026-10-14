@@ -18,6 +18,9 @@
 //!     default and namespace imports from relative paths and from the `@/`
 //!     alias (resolved inside the importing file's own app), following
 //!     re-exports (`__init__.py`, barrel `index.ts`) a few hops deep.
+//!     C# goes its own way (`resolve_cs`): types through namespaces
+//!     (`using`, the file's own namespace), methods through the type of
+//!     the receiver, partial types merged into one node.
 //!     Only if the caller is still unresolved at every tighter tier does it
 //!     fall back to the loose global search, and even then it refuses
 //!     names that are too common (`max_ambiguous`).
@@ -36,8 +39,10 @@
 //! On a ~64k-file polyglot repo this runs in ~1.4s with ~3.1GB peak RSS,
 //! producing ~773k nodes and ~1.5M edges. That is the target profile.
 
+use crate::grammar_files::csharp::simple_type;
 use crate::struc::kb_struct::{
-    CallGraph, CallGraphEdge, CallGraphNode, CallerInfo, FileData, KnowledgeBase, Parameter,
+    CallGraph, CallGraphEdge, CallGraphNode, CallerInfo, FileData, FunctionCall, KnowledgeBase,
+    Parameter,
 };
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -63,6 +68,43 @@ const EDGE_INHERIT: u8 = 1;
 /// How many re-export hops (`__init__.py`, barrel `index.ts`) an import is
 /// followed through before giving up.
 const MAX_REEXPORT: u8 = 3;
+/// `language_family` of C#.
+const CSHARP: u8 = 7;
+/// Members of `object`, LINQ / EF Core, `string`, collections, `Task` and
+/// `HttpClient`. A call to one of these on a receiver of unknown type
+/// (`db.Issues.Where(..)`, `x.ToString()`) is the BCL far more often than a
+/// project method that happens to share the name, so it is never guessed
+/// by name. A receiver of known type still reaches a project method of
+/// that name.
+#[rustfmt::skip]
+const CS_BCL_NAMES: &[&str] = &[
+    "Add", "AddAsync", "AddRange", "Aggregate", "All", "Any", "AnyAsync", "Append",
+    "AppendLine", "AsEnumerable", "AsNoTracking", "AsQueryable", "Average", "Build", "Cast",
+    "Chunk", "Clear", "Clone", "CompareTo", "Concat", "ConfigureAwait", "Contains",
+    "ContainsKey", "ContinueWith", "Count", "CountAsync", "DeleteAsync", "Dequeue",
+    "Deserialize", "Dispose", "DisposeAsync", "Distinct", "DistinctBy", "ElementAt", "EndsWith",
+    "Enqueue", "EnsureSuccessStatusCode", "Equals", "Except", "ExecuteDeleteAsync",
+    "ExecuteUpdateAsync", "FindAsync", "First", "FirstAsync", "FirstOrDefault",
+    "FirstOrDefaultAsync", "ForEach", "Format", "GetAsync", "GetHashCode", "GetType",
+    "GetValueOrDefault", "GroupBy", "Include", "IndexOf", "Insert", "Intersect", "Join", "Last",
+    "LastOrDefault", "Max", "MaxAsync", "MaxBy", "Min", "MinAsync", "MinBy", "OfType", "Order",
+    "OrderBy", "OrderByDescending", "Parse", "PatchAsync", "Pop", "PostAsync", "Prepend",
+    "Push", "PutAsync", "ReadAsStringAsync", "ReadFromJsonAsync", "Remove", "RemoveAll",
+    "RemoveRange", "Replace", "Reverse", "SaveChanges", "SaveChangesAsync", "Select",
+    "SelectMany", "SendAsync", "SequenceEqual", "Serialize", "Single", "SingleAsync",
+    "SingleOrDefault", "SingleOrDefaultAsync", "Skip", "Split", "StartsWith", "Substring",
+    "Sum", "SumAsync", "Take", "ThenBy", "ThenByDescending", "ThenInclude", "ToArray",
+    "ToArrayAsync", "ToDictionary", "ToDictionaryAsync", "ToHashSet", "ToList", "ToListAsync",
+    "ToLower", "ToLowerInvariant", "ToLookup", "ToString", "ToUpper", "ToUpperInvariant",
+    "Trim", "TrimEnd", "TrimStart", "TryAdd", "TryGetValue", "TryParse", "Union", "Update",
+    "Wait", "Where", "Write", "WriteAsync", "WriteLine", "Zip",
+    // EF Core model and migration builders, Regex.
+    "Column", "Entity", "HasAnnotation", "HasColumnName", "HasColumnType", "HasConversion",
+    "HasData", "HasDefaultValue", "HasDefaultValueSql", "HasFilter", "HasForeignKey",
+    "HasIndex", "HasKey", "HasMany", "HasMaxLength", "HasOne", "Ignore", "IsRequired",
+    "IsUnique", "Match", "Matches", "Navigation", "OwnsMany", "OwnsOne", "Property", "ToTable",
+    "WithMany", "WithOne",
+];
 
 /// How a call edge was resolved. Lower = tighter; when one caller reaches
 /// the same target twice, the tighter resolution is kept.
@@ -155,6 +197,11 @@ struct Node<'a> {
     file: u32,
     is_entry: bool,
     owner: Option<&'a str>,
+    /// C# `static T F(this X x)`: reachable as `x.F()` on any receiver.
+    is_ext: bool,
+    /// C# `partial` type: its namespace-qualified name. All parts of one
+    /// type become a single node.
+    partial: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +235,15 @@ struct FileImports<'a> {
     namespaces: Map<&'a str, Target<'a>>,
     /// `from m import *` / `export * from "m"` — everything re-exported.
     star: Vec<&'a [u32]>,
+    /// C#: files whose types are visible without qualification, tightest
+    /// first — the file's own namespace and its parents (`package`), then
+    /// `using` and `global using` namespaces (`import`). Not followed as
+    /// re-exports: a `using` is not visible to the importer's importers.
+    cs_scopes: Vec<(&'a [u32], Via)>,
+    /// C# `using static A.B.C;`: (files of namespace `A.B`, `C`).
+    cs_static: Vec<(&'a [u32], &'a str)>,
+    /// C# `using X = A.B.C;`: `X` -> (files of namespace `A.B`, `C`).
+    cs_alias: Map<&'a str, (&'a [u32], &'a str)>,
 }
 
 /// Everything a single parallel chunk extracts from its slice of files.
@@ -296,6 +352,7 @@ fn language_family(language: &str) -> u8 {
         "rust" => 4,
         "java" => 5,
         "c" | "cpp" => 6,
+        "csharp" => CSHARP,
         _ => 0,
     }
 }
@@ -342,6 +399,12 @@ struct ModuleIndex<'a> {
     /// Full file stem only (`apps/web/src/lib/x`) — exact path lookups for
     /// relative imports, where a suffix match would be a guess.
     stems: Map<&'a str, Vec<u32>>,
+    /// C# namespace -> files declaring a type in it, sorted; `""` is the
+    /// global namespace. A C# `using` names a namespace, not a path, and
+    /// namespaces need not follow directories.
+    cs_ns: Map<&'a str, Vec<u32>>,
+    /// C# `global using` namespaces, from every file of the project.
+    cs_global: Vec<&'a str>,
 }
 
 fn build_module_index<'a>(files: &[&'a str]) -> ModuleIndex<'a> {
@@ -361,7 +424,47 @@ fn build_module_index<'a>(files: &[&'a str]) -> ModuleIndex<'a> {
             add_suffixes(&mut map, &stem[..slash], i as u32);
         }
     }
-    ModuleIndex { suffix: map, stems }
+    ModuleIndex {
+        suffix: map,
+        stems,
+        cs_ns: Map::new(),
+        cs_global: Vec::new(),
+    }
+}
+
+/// Namespaces a C# file declares types in (`""` for the global one).
+fn cs_namespaces(fd: &FileData) -> impl Iterator<Item = &str> {
+    fd.classes.iter().map(|c| {
+        c.lang_info
+            .csharp
+            .as_ref()
+            .and_then(|i| i.namespace.as_deref())
+            .unwrap_or("")
+    })
+}
+
+fn index_csharp<'a>(index: &mut ModuleIndex<'a>, files: &[(&'a str, &'a FileData)]) {
+    for (i, (_, fd)) in files.iter().enumerate() {
+        if language_family(&fd.language) != CSHARP {
+            continue;
+        }
+        for ns in cs_namespaces(fd) {
+            let v = index.cs_ns.entry(ns).or_default();
+            if v.last() != Some(&(i as u32)) {
+                v.push(i as u32);
+            }
+        }
+        for imp in &fd.imports {
+            if imp.modifiers.iter().any(|m| m == "global")
+                && !imp.modifiers.iter().any(|m| m == "static")
+                && imp.alias.is_none()
+            {
+                index.cs_global.push(imp.module.as_str());
+            }
+        }
+    }
+    index.cs_global.sort_unstable();
+    index.cs_global.dedup();
 }
 
 /// Exact project path (no extension) -> files: the module file itself, else
@@ -490,6 +593,7 @@ fn build_file_imports<'a>(
     match language_family(&fd.language) {
         1 => python_imports(fd, path, index),
         2 => js_imports(fd, path, index),
+        CSHARP => csharp_imports(fd, index),
         _ => generic_imports(fd, index),
     }
 }
@@ -578,6 +682,65 @@ fn js_imports<'a>(fd: &'a FileData, path: &str, index: &'a ModuleIndex<'a>) -> F
         }
         if let Some(a) = imp.alias.as_deref() {
             out.namespaces.entry(a).or_insert(target);
+        }
+    }
+    out
+}
+
+/// C#: a `using` brings in a namespace, wherever its files are; the file's
+/// own namespace and its parents are visible without one.
+fn csharp_imports<'a>(fd: &'a FileData, index: &'a ModuleIndex<'a>) -> FileImports<'a> {
+    let mut out = FileImports::default();
+    let ns_files = |ns: &str| index.cs_ns.get(ns).map(Vec::as_slice);
+    let mut own: Vec<&str> = cs_namespaces(fd).collect();
+    if own.is_empty() {
+        own.push("");
+    }
+    own.sort_unstable();
+    own.dedup();
+    let mut seen: Vec<&str> = Vec::new();
+    for ns in own {
+        // `A.B.C` sees `A.B.C`, `A.B`, `A` and the global namespace.
+        let mut cur = ns;
+        loop {
+            if !seen.contains(&cur) {
+                seen.push(cur);
+                if let Some(fs) = ns_files(cur) {
+                    out.cs_scopes.push((fs, Via::Package));
+                }
+            }
+            if cur.is_empty() {
+                break;
+            }
+            cur = cur.rsplit_once('.').map_or("", |(p, _)| p);
+        }
+    }
+    let split = |m: &'a str| m.rsplit_once('.').unwrap_or(("", m));
+    for imp in &fd.imports {
+        let m = imp.module.as_str();
+        if let Some(a) = imp.alias.as_deref() {
+            let (ns, ty) = split(m);
+            if let Some(fs) = ns_files(ns) {
+                out.cs_alias.insert(a, (fs, ty));
+            }
+        } else if imp.modifiers.iter().any(|x| x == "static") {
+            let (ns, ty) = split(m);
+            if let Some(fs) = ns_files(ns) {
+                out.cs_static.push((fs, ty));
+            }
+        } else if !seen.contains(&m) {
+            seen.push(m);
+            if let Some(fs) = ns_files(m) {
+                out.cs_scopes.push((fs, Via::Import));
+            }
+        }
+    }
+    for &g in &index.cs_global {
+        if !seen.contains(&g) {
+            seen.push(g);
+            if let Some(fs) = ns_files(g) {
+                out.cs_scopes.push((fs, Via::Import));
+            }
         }
     }
     out
@@ -688,6 +851,9 @@ struct Resolver<'a> {
     methods: &'a [(u32, &'a str, u32)],
     parents: Map<u32, Vec<u32>>,
     children: Map<u32, Vec<u32>>,
+    /// C#: (type idx, field / property / primary constructor parameter)
+    /// -> its declared type. Every part of a partial type contributes.
+    cs_members: &'a Map<(u32, &'a str), &'a str>,
     max_ambiguous: usize,
     strict_imports: bool,
 }
@@ -1011,6 +1177,9 @@ impl<'a> Resolver<'a> {
         if let Some(&i) = self.node_map.get(base) {
             return Some(i);
         }
+        if self.file_family[file as usize] == CSHARP {
+            return self.cs_type(base, file).map(|(c, _)| c);
+        }
         // `Base<T>` / `Base[]` / `Base(args)` -> `Base`. Generic args and
         // array suffixes are irrelevant to *which class* the base refers to.
         let base = base.split(['<', '[', '(']).next().unwrap_or(base).trim();
@@ -1024,6 +1193,235 @@ impl<'a> Resolver<'a> {
             }
         }
         self.lookup(name, file, Want::Class).map(|h| h.best())
+    }
+}
+
+// ───────────────────────────── C# ─────────────────────────────
+//
+// C# names are resolved through namespaces, not paths: a type is visible
+// in its own file, its own namespace (and the parents of it), and the
+// namespaces the file `using`s. A method is reached through the type of its
+// receiver — the parser types parameters and locals, `cs_members` types
+// fields, properties and primary constructor parameters — and only a
+// receiver of unknown type falls back to a by-name guess.
+impl<'a> Resolver<'a> {
+    fn is_cs_type(&self, c: u32) -> bool {
+        let n = &self.nodes[c as usize];
+        n.kind == Kind::Class && self.file_family[n.file as usize] == CSHARP
+    }
+
+    /// The project type `t` names from `file`, and how it was found.
+    /// `None` for a type outside the project (BCL, packages).
+    fn cs_type(&self, t: &str, file: u32) -> Option<(u32, Via)> {
+        let t = simple_type(t);
+        let (qual, name) = match t.rsplit_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, t.as_str()),
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let imp = &self.imports[file as usize];
+        if qual.is_none() {
+            if let Some(&(fs, real)) = imp.cs_alias.get(name) {
+                return self.cs_type_in(real, fs).map(|c| (c, Via::Import));
+            }
+        }
+        let cands = self.by_name.get(name)?;
+        if let Some(&c) = cands
+            .iter()
+            .find(|&&c| self.is_cs_type(c) && self.nodes[c as usize].file == file)
+        {
+            return Some((c, Via::Local));
+        }
+        for &(fs, via) in &imp.cs_scopes {
+            if let Some(c) = self.cs_type_in(name, fs) {
+                return Some((c, via));
+            }
+        }
+        None
+    }
+
+    fn cs_type_in(&self, name: &str, fs: &[u32]) -> Option<u32> {
+        self.by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .find(|&c| self.is_cs_type(c) && fs.binary_search(&self.nodes[c as usize].file).is_ok())
+    }
+
+    /// Declared type of member `name` of `class` or of one of its bases.
+    fn cs_member_type(&self, class: u32, name: &str) -> Option<&'a str> {
+        let mut queue: VecDeque<u32> = VecDeque::from([class]);
+        let mut visited: Vec<u32> = Vec::new();
+        while let Some(c) = queue.pop_front() {
+            if visited.contains(&c) || visited.len() > MAX_CHAIN {
+                continue;
+            }
+            visited.push(c);
+            if let Some(&t) = self.cs_members.get(&(c, name)) {
+                return Some(t);
+            }
+            if let Some(next) = self.parents.get(&c) {
+                queue.extend(next.iter().copied());
+            }
+        }
+        None
+    }
+
+    /// By-name candidates -> a `name` / `ambiguous` hit, or nothing if
+    /// there are too many to mean anything.
+    fn cs_guess(&self, mut cands: Vec<u32>, file: u32) -> Option<Hit> {
+        match cands.len() {
+            0 => None,
+            1 => Some(Hit::One(cands[0], Via::Name)),
+            n if n > self.max_ambiguous.max(1) => None,
+            _ => {
+                let here = self.files[file as usize];
+                cands.sort_by_key(|&c| {
+                    let f = self.files[self.nodes[c as usize].file as usize];
+                    (Reverse(common_dir_prefix(here, f)), c)
+                });
+                Some(Hit::Many(cands))
+            }
+        }
+    }
+
+    /// `x.name()` where `x` is of a type without `name`, or of a type
+    /// outside the project: only an extension method can be meant. One in a
+    /// namespace the file sees is tied by it; any other is a guess.
+    fn cs_extension(&self, name: &str, file: u32) -> Option<Hit> {
+        let cands: Vec<u32> = self
+            .by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|&c| {
+                let n = &self.nodes[c as usize];
+                n.is_ext && self.file_family[n.file as usize] == CSHARP
+            })
+            .collect();
+        for &(fs, via) in &self.imports[file as usize].cs_scopes {
+            if let Some(&c) = cands
+                .iter()
+                .find(|&&c| fs.binary_search(&self.nodes[c as usize].file).is_ok())
+            {
+                return Some(Hit::One(c, via));
+            }
+        }
+        self.cs_guess(cands, file)
+    }
+
+    /// `x.name()` with `x` of unknown type: any C# method of that name —
+    /// unless every one is an extension method, which then is the one the
+    /// file's namespaces bring in (`db.Projects.InAccessibleProjects(..)`).
+    fn cs_by_name(&self, name: &str, file: u32) -> Option<Hit> {
+        if CS_BCL_NAMES.contains(&name) {
+            return None;
+        }
+        let cands: Vec<u32> = self
+            .by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|&c| {
+                let n = &self.nodes[c as usize];
+                n.kind == Kind::Method && self.file_family[n.file as usize] == CSHARP
+            })
+            .collect();
+        if !cands.is_empty() && cands.iter().all(|&c| self.nodes[c as usize].is_ext) {
+            return self.cs_extension(name, file);
+        }
+        self.cs_guess(cands, file)
+    }
+
+    fn resolve_cs(&self, call: &FunctionCall, file: u32, class: Option<u32>) -> Option<Hit> {
+        let callee = call.callee.as_str();
+        // Constructor parameter (DI) and `new T(..)`: the type itself.
+        if call.context == "inject" {
+            return self.cs_type(callee, file).map(|(c, v)| Hit::One(c, v));
+        }
+        if let Some(t) = callee.strip_prefix("new ") {
+            return self.cs_type(t, file).map(|(c, v)| Hit::One(c, v));
+        }
+        let (qual, name) = split_callee(callee);
+        if name.is_empty() {
+            return None;
+        }
+        let Some(q) = qual else {
+            // `Foo()`: a method of this type or its bases, of a `using
+            // static` type, or (nested types calling statics of the outer
+            // one) a method of the same file.
+            if let Some(m) = class.and_then(|c| self.method_in_hierarchy(c, name)) {
+                return Some(Hit::One(m, Via::Local));
+            }
+            for &(fs, ty) in &self.imports[file as usize].cs_static {
+                if let Some(m) = self
+                    .cs_type_in(ty, fs)
+                    .and_then(|c| self.method_in_hierarchy(c, name))
+                {
+                    return Some(Hit::One(m, Via::Import));
+                }
+            }
+            return self.by_name.get(name).and_then(|cands| {
+                cands
+                    .iter()
+                    .copied()
+                    .find(|&c| {
+                        let n = &self.nodes[c as usize];
+                        n.file == file && n.kind != Kind::Class
+                    })
+                    .map(|c| Hit::One(c, Via::Local))
+            });
+        };
+        match q {
+            "this" => {
+                return class
+                    .and_then(|c| self.method_in_hierarchy(c, name))
+                    .map(|m| Hit::One(m, Via::Local));
+            }
+            "base" => {
+                return class
+                    .and_then(|c| self.walk(c, name, &self.parents))
+                    .map(|m| Hit::One(m, Via::Local));
+            }
+            _ => {}
+        }
+        // The receiver's type: from the parser for a local, from the class
+        // for a member (`_db.X()`, `this._db.X()`, `transition.X()`).
+        let member = q.strip_prefix("this.").unwrap_or(q);
+        let simple = !member.contains('.');
+        let ty: Option<&str> = match call.defined_in.as_deref() {
+            Some("var") => return self.cs_by_name(name, file),
+            Some(t) => Some(t),
+            None if simple => class.and_then(|c| self.cs_member_type(c, member)),
+            None => None,
+        };
+        if let Some(t) = ty {
+            if let Some((cls, via)) = self.cs_type(t, file) {
+                if let Some(m) = self.method_in_hierarchy(cls, name) {
+                    return Some(Hit::One(m, via));
+                }
+            }
+            return self.cs_extension(name, file);
+        }
+        // `Type.Static()` / `Ns.Type.Static()`: every segment capitalised.
+        let looks_like_type = q
+            .split('.')
+            .all(|s| s.starts_with(|c: char| c.is_ascii_uppercase()));
+        if looks_like_type {
+            if let Some((cls, via)) = self.cs_type(q, file) {
+                return self
+                    .method_in_hierarchy(cls, name)
+                    .map(|m| Hit::One(m, via));
+            }
+            if simple {
+                // A type outside the project (`Math.Max`, `Results.Ok`).
+                return None;
+            }
+        }
+        // A chain (`_db.Issues.Add()`), a name we cannot type: by name.
+        self.cs_by_name(name, file)
     }
 }
 
@@ -1076,7 +1474,8 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
     // stay fed while keeping per-task `Vec`s small enough for cache.
     let threads = rayon::current_num_threads().max(1);
     let chunk = (files.len() / (threads * 8)).clamp(16, 2048);
-    let module_index = build_module_index(&paths);
+    let mut module_index = build_module_index(&paths);
+    index_csharp(&mut module_index, &files);
 
     // 1. Nodes, class->base refs and resolved imports (parallel, order-preserving).
     let extracts: Vec<Extract> = files
@@ -1104,6 +1503,8 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                         file: f,
                         is_entry: func.tags.iter().any(|t| t.as_str() == ENTRY_TAG),
                         owner: None,
+                        is_ext: false,
+                        partial: None,
                     });
                 }
                 for class in &fd.classes {
@@ -1114,6 +1515,13 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                         file: f,
                         is_entry: false,
                         owner: None,
+                        is_ext: false,
+                        partial: class
+                            .lang_info
+                            .csharp
+                            .as_ref()
+                            .filter(|i| i.is_partial)
+                            .and_then(|i| i.full_name.as_deref()),
                     });
                     for base in &class.bases {
                         ex.bases.push(BaseRef {
@@ -1129,8 +1537,10 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                             name: node_name(&m.name, &m.id),
                             kind: Kind::Method,
                             file: f,
-                            is_entry: false,
+                            is_entry: m.tags.iter().any(|t| t.as_str() == ENTRY_TAG),
                             owner: Some(&class.id),
+                            is_ext: m.lang_info.csharp.as_ref().is_some_and(|i| i.is_extension),
+                            partial: None,
                         });
                     }
                 }
@@ -1145,12 +1555,43 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
     // is still fast — all the expensive per-file work already happened in
     // step 1. If two parser outputs disagree on an ID, the earlier file
     // (per sort order) wins, so the result is deterministic.
+    //
+    // The parts of a C# partial type (`AppDbContext.cs`, `AppDbContext.Legal.cs`)
+    // are one type: one node, the part in the file named after the type if
+    // there is one, else the first. The other parts' ids point at it, so
+    // their methods, bases and members all belong to it.
+    let mut canonical: Map<&str, (&str, bool)> = Map::new();
+    for ex in &extracts {
+        for n in &ex.nodes {
+            let Some(key) = n.partial else { continue };
+            let file = paths[n.file as usize];
+            let stem = file.rsplit('/').next().unwrap_or(file);
+            let named = stem.strip_suffix(".cs") == Some(n.name);
+            match canonical.entry(key) {
+                Entry::Vacant(v) => {
+                    v.insert((n.id, named));
+                }
+                Entry::Occupied(mut o) => {
+                    if named && !o.get().1 {
+                        o.insert((n.id, true));
+                    }
+                }
+            }
+        }
+    }
     let mut nodes: Vec<Node> = Vec::new();
     let mut node_map: Map<&str, u32> = Map::new();
     let mut base_refs: Vec<BaseRef> = Vec::new();
     let mut imports: Vec<FileImports> = Vec::with_capacity(files.len());
+    let mut part_of: Vec<(&str, &str)> = Vec::new();
     for ex in extracts {
         for n in ex.nodes {
+            if let Some(&(canon, _)) = n.partial.and_then(|k| canonical.get(k)) {
+                if canon != n.id {
+                    part_of.push((n.id, canon));
+                    continue;
+                }
+            }
             if let Entry::Vacant(v) = node_map.entry(n.id) {
                 v.insert(nodes.len() as u32);
                 nodes.push(n);
@@ -1158,6 +1599,11 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
         }
         base_refs.extend(ex.bases);
         imports.extend(ex.imports);
+    }
+    for (part, canon) in part_of {
+        if let Some(&i) = node_map.get(canon) {
+            node_map.entry(part).or_insert(i);
+        }
     }
 
     let mut by_name: Map<&str, Vec<u32>> = Map::with_capacity(nodes.len());
@@ -1175,6 +1621,27 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
         .collect();
     methods.sort_unstable();
 
+    // C# member types: `_db` -> `AppDbContext`, `transition` (a primary
+    // constructor parameter) -> `IssueTransition`.
+    let mut cs_members: Map<(u32, &str), &str> = Map::new();
+    for &(_, fd) in files
+        .iter()
+        .filter(|f| language_family(&f.1.language) == CSHARP)
+    {
+        for class in &fd.classes {
+            let Some(&cidx) = node_map.get(class.id.as_str()) else {
+                continue;
+            };
+            for a in &class.attributes {
+                let t = a.type_annotation.as_str();
+                let t = t.strip_prefix("event ").unwrap_or(t);
+                if !t.is_empty() && t != "enum_member" {
+                    cs_members.entry((cidx, a.name.as_str())).or_insert(t);
+                }
+            }
+        }
+    }
+
     let mut r = Resolver {
         nodes: &nodes,
         node_map: &node_map,
@@ -1186,6 +1653,7 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
         methods: &methods,
         parents: Map::new(),
         children: Map::new(),
+        cs_members: &cs_members,
         max_ambiguous: opts.max_ambiguous,
         strict_imports: opts.strict_imports,
     };
@@ -1235,12 +1703,18 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
             let mut buf: Vec<RawEdge> = Vec::new();
             for (j, &(_, fd)) in slice.iter().enumerate() {
                 let f = (ci * chunk + j) as u32;
+                let cs = r.file_family[f as usize] == CSHARP;
                 for func in &fd.functions {
                     let Some(&from) = r.node_map.get(func.id.as_str()) else {
                         continue;
                     };
                     for call in &func.calls {
-                        if let Some(hit) = r.resolve_call(&call.callee, f, None, false) {
+                        let hit = if cs {
+                            r.resolve_cs(call, f, None)
+                        } else {
+                            r.resolve_call(&call.callee, f, None, false)
+                        };
+                        if let Some(hit) = hit {
                             push_hit(&mut buf, from, hit, call);
                         }
                     }
@@ -1258,8 +1732,12 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                         // shortcut in `resolve_call`.
                         let has_self = first_self_param(&m.params);
                         for call in &m.calls {
-                            if let Some(hit) = r.resolve_call(&call.callee, f, Some(cidx), has_self)
-                            {
+                            let hit = if cs {
+                                r.resolve_cs(call, f, Some(cidx))
+                            } else {
+                                r.resolve_call(&call.callee, f, Some(cidx), has_self)
+                            };
+                            if let Some(hit) = hit {
                                 push_hit(&mut buf, from, hit, call);
                             }
                         }
