@@ -150,6 +150,9 @@ pub struct CallerInfo {
     pub function: String,
     pub file: String,
     pub line: usize,
+    /// How the call edge was resolved; see `CallGraphEdge::resolution`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolution: String,
 }
 
 // Variable tracking for data flow
@@ -294,6 +297,16 @@ pub struct CallGraphEdge {
     pub edge_type: String, // "calls", "inherits", "uses"
     pub conditional: bool,
     pub call_site_line: usize,
+    /// Call edges only (PRISM v2), how the callee was pinned down:
+    ///   "import"    — through an import of the caller's file
+    ///   "local"     — same file, or the caller's class hierarchy
+    ///   "package"   — same directory / package
+    ///   "name"      — by bare name, the only candidate in the project
+    ///   "ambiguous" — by bare name, one of several candidates; the caller
+    ///                 has one such edge per candidate
+    /// Empty for inheritance edges and for PRISM v1.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resolution: String,
 }
 
 // Dependency graph structure (missing from original)

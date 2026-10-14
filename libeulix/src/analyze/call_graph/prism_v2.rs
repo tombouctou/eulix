@@ -12,10 +12,22 @@
 //!     `Get`...), which is the common case in real repos.
 //!
 //!   * v2 resolves the same short name through a *scope ladder*:
-//!     same file  →  explicit import  →  same package/dir  →  project-wide
-//!     Only if the caller is still ambiguous at every tighter tier does it
+//!     explicit import  →  same file  →  same package/dir  →  project-wide
+//!     Imports are resolved to files: Python `from m import f [as g]`,
+//!     `import a.b [as c]`, relative `from .m import f`; JS/TS named,
+//!     default and namespace imports from relative paths and from the `@/`
+//!     alias (resolved inside the importing file's own app), following
+//!     re-exports (`__init__.py`, barrel `index.ts`) a few hops deep.
+//!     Only if the caller is still unresolved at every tighter tier does it
 //!     fall back to the loose global search, and even then it refuses
 //!     names that are too common (`max_ambiguous`).
+//!
+//!   * Every call edge records *how* it was resolved (`resolution`):
+//!     `import` / `local` / `package` are tied to the caller's code;
+//!     `name` is a by-name guess with a single candidate in the project;
+//!     `ambiguous` is a by-name guess with several candidates — the caller
+//!     then gets one `ambiguous` edge per candidate instead of a silently
+//!     picked one, and queries show them apart from the exact callers.
 //!
 //! v2 also understands class hierarchies: `self.foo()` and
 //! `BaseClass.foo()` can be resolved through the inheritance chain rather
@@ -48,6 +60,49 @@ const SELF_NAMES: [&str; 6] = ["self", "this", "cls", "_self", "self_", "myself"
 const MAX_CHAIN: usize = 64;
 const EDGE_CALL: u8 = 0;
 const EDGE_INHERIT: u8 = 1;
+/// How many re-export hops (`__init__.py`, barrel `index.ts`) an import is
+/// followed through before giving up.
+const MAX_REEXPORT: u8 = 3;
+
+/// How a call edge was resolved. Lower = tighter; when one caller reaches
+/// the same target twice, the tighter resolution is kept.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Via {
+    Import = 0,
+    Local = 1,
+    Package = 2,
+    Name = 3,
+    Ambiguous = 4,
+}
+
+impl Via {
+    fn as_str(self) -> &'static str {
+        match self {
+            Via::Import => "import",
+            Via::Local => "local",
+            Via::Package => "package",
+            Via::Name => "name",
+            Via::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+/// Result of resolving one reference.
+enum Hit {
+    One(u32, Via),
+    /// Several equally good by-name candidates, best guess first.
+    Many(Vec<u32>),
+}
+
+impl Hit {
+    /// The single best guess (for inheritance, class qualifiers).
+    fn best(&self) -> u32 {
+        match self {
+            Hit::One(i, _) => *i,
+            Hit::Many(v) => v[0],
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CallGraphOptions {
@@ -109,6 +164,7 @@ struct RawEdge {
     line: u32,
     kind: u8,
     conditional: bool,
+    via: Via,
 }
 
 struct BaseRef<'a> {
@@ -125,9 +181,13 @@ type Target<'a> = Option<&'a [u32]>;
 #[derive(Default)]
 struct FileImports<'a> {
     /// `import { foo } from "x"` — `foo` may be called bare as `foo()`.
-    names: Map<&'a str, Target<'a>>,
+    /// Value: where it comes from, and its name *there* (`import { a as b }`
+    /// binds `b`, but the definition is called `a`).
+    names: Map<&'a str, (Target<'a>, &'a str)>,
     /// `import * as ns from "x"` or `import x.y` — `ns.foo()` / `x.y.foo()`.
     namespaces: Map<&'a str, Target<'a>>,
+    /// `from m import *` / `export * from "m"` — everything re-exported.
+    star: Vec<&'a [u32]>,
 }
 
 /// Everything a single parallel chunk extracts from its slice of files.
@@ -203,7 +263,21 @@ fn first_self_param(params: &[Parameter]) -> bool {
 
 #[inline]
 fn is_self_qualifier(q: &str) -> bool {
-    SELF_NAMES.contains(&q) || q == "Self"
+    SELF_NAMES.contains(&q) || q == "Self" || q == "super"
+}
+
+/// Name a node is indexed by: the parser's own `name` (last dotted / `::`
+/// segment), falling back to the id. The id alone is not enough: Python and
+/// JS/TS method ids are `method_<Class>_<name>`, so `bare_name` would give
+/// `Class_name` and no `self.name()` call could ever reach the method.
+fn node_name<'a>(name: &'a str, id: &'a str) -> &'a str {
+    let n = name.rsplit("::").next().unwrap_or(name);
+    let n = n.rsplit('.').next().unwrap_or(n).trim();
+    if n.is_empty() {
+        bare_name(id)
+    } else {
+        n
+    }
 }
 
 /// Number of leading path components `a` and `b` share (byte-aligned to `/`).
@@ -262,8 +336,17 @@ fn add_suffixes<'a>(map: &mut Map<&'a str, Vec<u32>>, s: &'a str, file: u32) {
     }
 }
 
-fn build_module_index<'a>(files: &[&'a str]) -> Map<&'a str, Vec<u32>> {
+struct ModuleIndex<'a> {
+    /// Every component-suffix of every stem and directory (see above).
+    suffix: Map<&'a str, Vec<u32>>,
+    /// Full file stem only (`apps/web/src/lib/x`) — exact path lookups for
+    /// relative imports, where a suffix match would be a guess.
+    stems: Map<&'a str, Vec<u32>>,
+}
+
+fn build_module_index<'a>(files: &[&'a str]) -> ModuleIndex<'a> {
     let mut map: Map<&'a str, Vec<u32>> = Map::with_capacity(files.len() * 3);
+    let mut stems: Map<&'a str, Vec<u32>> = Map::with_capacity(files.len());
     for (i, &path) in files.iter().enumerate() {
         let cleaned = clean_path(path);
         // File "stem": drop the extension, but only if the last `.` is not
@@ -273,14 +356,99 @@ fn build_module_index<'a>(files: &[&'a str]) -> Map<&'a str, Vec<u32>> {
             _ => cleaned,
         };
         add_suffixes(&mut map, stem, i as u32);
+        stems.entry(stem).or_default().push(i as u32);
         if let Some(slash) = stem.rfind('/') {
             add_suffixes(&mut map, &stem[..slash], i as u32);
         }
     }
-    map
+    ModuleIndex { suffix: map, stems }
 }
 
-fn resolve_module<'a>(module: &str, index: &'a Map<&'a str, Vec<u32>>) -> Target<'a> {
+/// Exact project path (no extension) -> files: the module file itself, else
+/// the package's `index` / `__init__`, else every file of that directory.
+fn resolve_path<'a>(p: &str, index: &'a ModuleIndex<'a>) -> Target<'a> {
+    if p.is_empty() {
+        return None;
+    }
+    if let Some(v) = index.stems.get(p) {
+        return Some(v.as_slice());
+    }
+    for tail in ["index", "__init__"] {
+        if let Some(v) = index.stems.get(format!("{p}/{tail}").as_str()) {
+            return Some(v.as_slice());
+        }
+    }
+    index.suffix.get(p).map(Vec::as_slice)
+}
+
+/// `a/b/../c/./d` -> `a/c/d`; `None` if `..` climbs above the root.
+fn normalize(p: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for part in p.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            _ => out.push(part),
+        }
+    }
+    Some(out.join("/"))
+}
+
+/// Python `..pkg.mod` imported from `a/b/c.py` -> `a/pkg/mod`.
+fn python_relative(file: &str, module: &str) -> Option<String> {
+    let dots = module.bytes().take_while(|&b| b == b'.').count();
+    let rest = &module[dots..];
+    let mut base: Vec<&str> = dir_of(file).split('/').filter(|s| !s.is_empty()).collect();
+    for _ in 1..dots {
+        base.pop()?;
+    }
+    base.extend(rest.split('.').filter(|s| !s.is_empty()));
+    Some(base.join("/"))
+}
+
+/// `./x`, `../y/z.js` relative to the importing file, extension dropped.
+fn js_relative(file: &str, module: &str) -> Option<String> {
+    let m = strip_js_ext(module);
+    normalize(&format!("{}/{}", dir_of(file), m))
+}
+
+fn strip_js_ext(m: &str) -> &str {
+    for ext in [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs"] {
+        if let Some(r) = m.strip_suffix(ext) {
+            return r;
+        }
+    }
+    m
+}
+
+/// `@/lib/x` (or `~/lib/x`) from `apps/web/src/app/page.tsx`: the alias
+/// points into the importing file's *own* app, so look for `<ancestor>/src/
+/// lib/x` from the nearest ancestor up — never into a sibling app. This is
+/// the `"@/*": ["./src/*"]` convention (Next.js, Expo); tsconfig `paths`
+/// themselves are not read.
+fn js_alias<'a>(file: &str, rest: &str, index: &'a ModuleIndex<'a>) -> Target<'a> {
+    let rest = strip_js_ext(rest);
+    let mut dir = dir_of(file);
+    loop {
+        let cand = if dir.is_empty() {
+            format!("src/{rest}")
+        } else {
+            format!("{dir}/src/{rest}")
+        };
+        if let Some(t) = normalize(&cand).and_then(|c| resolve_path(&c, index)) {
+            return Some(t);
+        }
+        if dir.is_empty() {
+            return None;
+        }
+        dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+    }
+}
+
+fn resolve_module<'a>(module: &str, index: &'a ModuleIndex<'a>) -> Target<'a> {
+    let index = &index.suffix;
     let mut m = module.trim().trim_start_matches(['.', '/']);
     // Peel common alias prefixes until none match.
     for p in ["@/", "~/", "crate::", "self::", "super::"] {
@@ -314,7 +482,109 @@ fn resolve_module<'a>(module: &str, index: &'a Map<&'a str, Vec<u32>>) -> Target
     }
 }
 
-fn build_file_imports<'a>(fd: &'a FileData, index: &'a Map<&'a str, Vec<u32>>) -> FileImports<'a> {
+fn build_file_imports<'a>(
+    fd: &'a FileData,
+    path: &str,
+    index: &'a ModuleIndex<'a>,
+) -> FileImports<'a> {
+    match language_family(&fd.language) {
+        1 => python_imports(fd, path, index),
+        2 => js_imports(fd, path, index),
+        _ => generic_imports(fd, index),
+    }
+}
+
+/// Exported name of a local import binding (`as` renames).
+fn exported_of<'a>(imp: &'a crate::struc::kb_struct::Import, local: &'a str) -> &'a str {
+    imp.renamed
+        .iter()
+        .find(|(l, _)| l == local)
+        .map_or(local, |(_, e)| e.as_str())
+}
+
+fn python_imports<'a>(fd: &'a FileData, path: &str, index: &'a ModuleIndex<'a>) -> FileImports<'a> {
+    let mut out = FileImports::default();
+    for imp in &fd.imports {
+        let module = imp.module.trim();
+        let relative = module.starts_with('.');
+        // Module path as a project path: `a.b.c` -> `a/b/c` (suffix-matched,
+        // which covers src-layout packages: `packages/x/src/a/b/c.py`), or
+        // `..a` -> an exact path next to the importing file.
+        let target = if relative {
+            python_relative(path, module).and_then(|p| resolve_path(&p, index))
+        } else {
+            resolve_module(module, index)
+        };
+        let submodule = |item: &str| -> Target<'a> {
+            if relative {
+                python_relative(path, module)
+                    .and_then(|p| normalize(&format!("{p}/{item}")))
+                    .and_then(|p| index.stems.get(p.as_str()).map(Vec::as_slice))
+            } else {
+                resolve_module(&format!("{module}.{item}"), index).filter(|_| !module.is_empty())
+            }
+        };
+        for item in &imp.items {
+            if item == "*" {
+                if let Some(fs) = target {
+                    out.star.push(fs);
+                }
+                continue;
+            }
+            let exported = exported_of(imp, item);
+            out.names.entry(item.as_str()).or_insert((target, exported));
+            // `from pkg import mod` + `mod.f()`: the item may be a module.
+            let ns = submodule(exported).or(target);
+            out.namespaces.entry(item.as_str()).or_insert(ns);
+        }
+        if imp.items.is_empty() {
+            // `import a.b.c` binds `a`; `import a.b.c as m` binds `m`.
+            let local = match imp.alias.as_deref() {
+                Some(a) => a,
+                None => module.split('.').next().unwrap_or(module),
+            };
+            if !local.is_empty() {
+                out.namespaces.entry(local).or_insert(target);
+            }
+        }
+    }
+    out
+}
+
+fn js_imports<'a>(fd: &'a FileData, path: &str, index: &'a ModuleIndex<'a>) -> FileImports<'a> {
+    let mut out = FileImports::default();
+    for imp in &fd.imports {
+        let m = imp.module.trim();
+        let target = if m.starts_with("./") || m.starts_with("../") || m == "." || m == ".." {
+            js_relative(path, m).and_then(|p| resolve_path(&p, index))
+        } else if let Some(rest) = m.strip_prefix("@/").or_else(|| m.strip_prefix("~/")) {
+            js_alias(path, rest, index)
+        } else {
+            // Bare specifier: a package. A workspace package may still map
+            // to project files by suffix; otherwise it is external.
+            resolve_module(m, index)
+        };
+        for item in &imp.items {
+            if item == "*" {
+                if let Some(fs) = target {
+                    out.star.push(fs);
+                }
+                continue;
+            }
+            let exported = exported_of(imp, item);
+            out.names.entry(item.as_str()).or_insert((target, exported));
+            // A default or namespace import can head a call: `api.get()`.
+            out.namespaces.entry(item.as_str()).or_insert(target);
+        }
+        if let Some(a) = imp.alias.as_deref() {
+            out.namespaces.entry(a).or_insert(target);
+        }
+    }
+    out
+}
+
+/// Go, Rust, Java, C/C++: the historical, module-suffix based behaviour.
+fn generic_imports<'a>(fd: &'a FileData, index: &'a ModuleIndex<'a>) -> FileImports<'a> {
     let mut out = FileImports::default();
     for imp in &fd.imports {
         let target = resolve_module(&imp.module, index);
@@ -323,8 +593,13 @@ fn build_file_imports<'a>(fd: &'a FileData, index: &'a Map<&'a str, Vec<u32>>) -
             // as the head of a qualified call (`foo.bar()`), so we register
             // it in both maps. `or_insert` keeps the first registration, so
             // a name imported twice does not flip-flop.
-            out.names.entry(item.as_str()).or_insert(target);
+            out.names
+                .entry(item.as_str())
+                .or_insert((target, exported_of(imp, item)));
             out.namespaces.entry(item.as_str()).or_insert(target);
+        }
+        if let Some(a) = imp.alias.as_deref() {
+            out.namespaces.entry(a).or_insert(target);
         }
         // `import "a/b/retrieval"` -> `retrieval.X()`;  `import a.b.c` -> `a.b.c.X()`
         let m = imp.module.trim_end_matches('/');
@@ -353,6 +628,7 @@ fn flush_edges(out: &mut Vec<RawEdge>, buf: &mut Vec<RawEdge>) {
         for e in it {
             if e.to == cur.to {
                 cur.conditional &= e.conditional;
+                cur.via = cur.via.min(e.via);
             } else {
                 out.push(cur);
                 cur = e;
@@ -377,6 +653,23 @@ fn rank(want: Want, k: Kind, strict: bool) -> Option<u8> {
         (Want::MethodCall, Function) => Some(1),
         (Want::MethodCall, Class) => Some(2),
     }
+}
+
+/// `rank`, plus what the caller's language rules out. In Python and JS/TS
+/// (`family` 1 / 2) a receiver call `x.f()` only ever reaches a method — a
+/// function or class of another module is reached through an import, which
+/// the namespace tier already handled — and a bare `f()` never reaches a
+/// method (that needs `self.` / `this.`). Without this, every
+/// `session.execute()` became a call to some project `def execute`.
+fn rank_in(family: u8, want: Want, k: Kind, strict: bool) -> Option<u8> {
+    if family == 1 || family == 2 {
+        match (want, k) {
+            (Want::MethodCall, Kind::Function | Kind::Class) => return None,
+            (Want::Call, Kind::Method) => return None,
+            _ => {}
+        }
+    }
+    rank(want, k, strict)
 }
 
 struct Resolver<'a> {
@@ -422,7 +715,7 @@ impl<'a> Resolver<'a> {
             if fam != 0 && cfam != 0 && fam != cfam {
                 continue;
             }
-            let Some(r) = rank(want, n.kind, strict) else {
+            let Some(r) = rank_in(fam, want, n.kind, strict) else {
                 continue;
             };
             eligible += 1;
@@ -443,40 +736,83 @@ impl<'a> Resolver<'a> {
 
     /// Restrict a name lookup to files belonging to a resolved import.
     /// `fs` is sorted, so the inner filter is a binary search per candidate.
-    fn lookup_in_files(&self, name: &str, fs: &[u32], file: u32, want: Want) -> Option<u32> {
-        let cands = self.by_name.get(name)?;
-        let it = cands
-            .iter()
-            .copied()
-            .filter(|&c| fs.binary_search(&self.nodes[c as usize].file).is_ok());
-        self.pick(it, want, false, file, true).0
+    /// If those files do not define `name` but re-export it (`__init__.py`
+    /// doing `from .x import name`, a barrel `export { name } from "./x"`,
+    /// `export *`), follow the re-export, at most `MAX_REEXPORT` hops.
+    fn lookup_in_files(
+        &self,
+        name: &str,
+        fs: &[u32],
+        file: u32,
+        want: Want,
+        depth: u8,
+    ) -> Option<u32> {
+        if let Some(cands) = self.by_name.get(name) {
+            let it = cands
+                .iter()
+                .copied()
+                .filter(|&c| fs.binary_search(&self.nodes[c as usize].file).is_ok());
+            if let (Some(x), _) = self.pick(it, want, false, file, true) {
+                return Some(x);
+            }
+        }
+        if depth >= MAX_REEXPORT {
+            return None;
+        }
+        for &f in fs {
+            let imp = &self.imports[f as usize];
+            if let Some(&(Some(next), exported)) = imp.names.get(name) {
+                if let Some(x) = self.lookup_in_files(exported, next, file, want, depth + 1) {
+                    return Some(x);
+                }
+            }
+            for next in &imp.star {
+                if let Some(x) = self.lookup_in_files(name, next, file, want, depth + 1) {
+                    return Some(x);
+                }
+            }
+        }
+        None
     }
 
     /// Scope ladder; the first tier that yields a candidate wins:
-    /// same file -> explicit import -> same package/dir -> project-wide (strict).
+    /// explicit import -> same file -> same package/dir -> project-wide.
     ///
     /// `by_name[name]` is globally sorted by file idx, and file idx is
     /// itself sorted by (dir, path). That lets each tier slice the candidate
     /// list with `partition_point` instead of filtering the whole thing.
-    fn lookup(&self, name: &str, file: u32, want: Want) -> Option<u32> {
-        let cands = self.by_name.get(name)?.as_slice();
+    fn lookup(&self, name: &str, file: u32, want: Want) -> Option<Hit> {
+        // Tier 1: explicit import. `(None, _)` means the import resolved
+        // to a module outside the project — under `strict_imports` we refuse
+        // to fall through, since that would just be guessing. A receiver
+        // call (`x.name()`) is not the imported `name`, so it skips this.
+        if want != Want::MethodCall {
+            let imp = &self.imports[file as usize];
+            match imp.names.get(name) {
+                Some(&(Some(fs), exported)) => {
+                    if let Some(x) = self.lookup_in_files(exported, fs, file, want, 0) {
+                        return Some(Hit::One(x, Via::Import));
+                    }
+                }
+                Some((None, _)) if self.strict_imports => return None,
+                _ => {}
+            }
+            // `from m import *` / `export * from "m"` in the caller's file.
+            for fs in &imp.star {
+                if let Some(x) = self.lookup_in_files(name, fs, file, want, 0) {
+                    return Some(Hit::One(x, Via::Import));
+                }
+            }
+        }
 
-        // Tier 1: same file.
+        let cands = self.by_name.get(name)?.as_slice();
+        let fam = self.file_family[file as usize];
+
+        // Tier 2: same file.
         let lo = cands.partition_point(|&c| self.nodes[c as usize].file < file);
         let hi = lo + cands[lo..].partition_point(|&c| self.nodes[c as usize].file <= file);
         if let (Some(x), _) = self.pick(cands[lo..hi].iter().copied(), want, false, file, false) {
-            return Some(x);
-        }
-
-        // Tier 2: explicit import. `Some(None)` means the import resolved
-        // to a file outside the project — under `strict_imports` we refuse
-        // to fall through to tiers 3/4, since that would just be guessing.
-        match self.imports[file as usize].names.get(name) {
-            Some(Some(fs)) if let Some(x) = self.lookup_in_files(name, fs, file, want) => {
-                return Some(x);
-            }
-            Some(None) if self.strict_imports => return None,
-            _ => {}
+            return Some(Hit::One(x, Via::Local));
         }
 
         // Tier 3: same package/dir. Same partition_point trick, on dir id.
@@ -484,16 +820,69 @@ impl<'a> Resolver<'a> {
         let dir_of_c = |c: u32| self.file_dir[self.nodes[c as usize].file as usize];
         let lo = cands.partition_point(|&c| dir_of_c(c) < d);
         let hi = lo + cands[lo..].partition_point(|&c| dir_of_c(c) <= d);
-        if let (Some(x), _) = self.pick(cands[lo..hi].iter().copied(), want, false, file, false) {
-            return Some(x);
+        if fam == 1 || fam == 2 {
+            // Python and JS/TS have no package scope: a sibling module's
+            // name is visible only through an import, so a hit here is a
+            // by-name guess, and is labelled as one — and, like any by-name
+            // guess, refused for a name too generic to mean anything
+            // (`x.get()` with a dozen `get` methods in the project).
+            let (_, eligible) = self.pick(cands.iter().copied(), want, true, file, false);
+            if eligible > self.max_ambiguous.max(1) {
+                return None;
+            }
+            if let Some(hit) = self.by_name_only(&cands[lo..hi], file, want, false) {
+                return Some(hit);
+            }
+        } else if let (Some(x), _) =
+            self.pick(cands[lo..hi].iter().copied(), want, false, file, false)
+        {
+            return Some(Hit::One(x, Via::Package));
         }
 
-        // Tier 4: project-wide, but only if the name is not too generic.
-        let (best, n) = self.pick(cands.iter().copied(), want, true, file, true);
-        if n > self.max_ambiguous.max(1) {
-            None
-        } else {
-            best
+        // Tier 4: project-wide, by name only, and only if the name is not
+        // too generic.
+        let (_, eligible) = self.pick(cands.iter().copied(), want, true, file, false);
+        if eligible > self.max_ambiguous.max(1) {
+            return None;
+        }
+        self.by_name_only(cands, file, want, true)
+    }
+
+    /// A by-name match among `cands`: the one best-ranked candidate -> a
+    /// `name` hit; several -> all of them (`ambiguous`), closest first.
+    /// Never a silent pick between equals.
+    fn by_name_only(&self, cands: &[u32], file: u32, want: Want, strict: bool) -> Option<Hit> {
+        let fam = self.file_family[file as usize];
+        let mut best_rank = u8::MAX;
+        let mut top: Vec<u32> = Vec::new();
+        for &c in cands {
+            let n = &self.nodes[c as usize];
+            let cfam = self.file_family[n.file as usize];
+            if fam != 0 && cfam != 0 && fam != cfam {
+                continue;
+            }
+            let Some(r) = rank_in(fam, want, n.kind, strict) else {
+                continue;
+            };
+            if r < best_rank {
+                best_rank = r;
+                top.clear();
+            }
+            if r == best_rank {
+                top.push(c);
+            }
+        }
+        match top.len() {
+            0 => None,
+            1 => Some(Hit::One(top[0], Via::Name)),
+            _ => {
+                let here = self.files[file as usize];
+                top.sort_by_key(|&c| {
+                    let f = self.files[self.nodes[c as usize].file as usize];
+                    (Reverse(common_dir_prefix(here, f)), c)
+                });
+                Some(Hit::Many(top))
+            }
         }
     }
 
@@ -550,10 +939,10 @@ impl<'a> Resolver<'a> {
         file: u32,
         class: Option<u32>,
         has_self: bool,
-    ) -> Option<u32> {
+    ) -> Option<Hit> {
         // Exact full-ID match always wins — no ambiguity possible.
         if let Some(&i) = self.node_map.get(callee) {
-            return Some(i);
+            return Some(Hit::One(i, Via::Local));
         }
         if callee.is_empty() || callee.contains('/') {
             return None;
@@ -567,19 +956,27 @@ impl<'a> Resolver<'a> {
         let Some(q) = qual else {
             // If the enclosing method has a self param, try the class chain
             // first — `foo()` inside a method could be a sibling method.
-            if has_self {
+            // Not in Python / JS / TS: there a sibling needs `self.` / `this.`,
+            // and a bare `foo()` is a module-level function.
+            let fam = self.file_family[file as usize];
+            if has_self && fam != 1 && fam != 2 {
                 if let Some(m) = class.and_then(|c| self.method_in_hierarchy(c, name)) {
-                    return Some(m);
+                    return Some(Hit::One(m, Via::Local));
                 }
             }
             return self.lookup(name, file, Want::Call);
         };
 
-        // `self.foo()` / `this.bar()` / `cls.baz()`
+        // `self.foo()` / `this.bar()` / `cls.baz()` / `super().foo()`
         if is_self_qualifier(q) {
             if let Some(m) = class.and_then(|c| self.method_in_hierarchy(c, name)) {
-                return Some(m);
+                return Some(Hit::One(m, Via::Local));
             }
+            return self.lookup(name, file, Want::MethodCall);
+        }
+
+        // `f(x).foo()`: the receiver is an expression we cannot type.
+        if q == "()" {
             return self.lookup(name, file, Want::MethodCall);
         }
 
@@ -588,8 +985,10 @@ impl<'a> Resolver<'a> {
         // resolve `name` inside those files only.
         let root = q.split(sep).next().unwrap_or(q);
         match self.imports[file as usize].namespaces.get(root) {
-            Some(Some(fs)) if let Some(x) = self.lookup_in_files(name, fs, file, Want::Call) => {
-                return Some(x);
+            Some(Some(fs)) => {
+                if let Some(x) = self.lookup_in_files(name, fs, file, Want::Call, 0) {
+                    return Some(Hit::One(x, Via::Import));
+                }
             }
             Some(None) if self.strict_imports => {
                 return None; // fmt.Println, os.path.join, ...
@@ -600,9 +999,9 @@ impl<'a> Resolver<'a> {
         // Class.staticMethod() / Class::method(): resolve the qualifier as
         // a class first, then search that class's method hierarchy.
         let q_last = q.rsplit(sep).next().unwrap_or(q);
-        if let Some(cls) = self.lookup(q_last, file, Want::Class) {
+        if let Some(Hit::One(cls, via)) = self.lookup(q_last, file, Want::Class) {
             if let Some(m) = self.method_in_hierarchy(cls, name) {
-                return Some(m);
+                return Some(Hit::One(m, via));
             }
         }
         self.lookup(name, file, Want::MethodCall)
@@ -619,12 +1018,12 @@ impl<'a> Resolver<'a> {
         if let Some(q) = qual {
             let root = q.split(sep).next().unwrap_or(q);
             if let Some(Some(fs)) = self.imports[file as usize].namespaces.get(root) {
-                if let Some(x) = self.lookup_in_files(name, fs, file, Want::Class) {
+                if let Some(x) = self.lookup_in_files(name, fs, file, Want::Class, 0) {
                     return Some(x);
                 }
             }
         }
-        self.lookup(name, file, Want::Class)
+        self.lookup(name, file, Want::Class).map(|h| h.best())
     }
 }
 
@@ -691,11 +1090,12 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
             };
             for (j, &(_, fd)) in slice.iter().enumerate() {
                 let f = (ci * chunk + j) as u32;
-                ex.imports.push(build_file_imports(fd, &module_index));
+                ex.imports
+                    .push(build_file_imports(fd, slice[j].0, &module_index));
                 for func in &fd.functions {
                     ex.nodes.push(Node {
                         id: &func.id,
-                        name: bare_name(&func.id),
+                        name: node_name(&func.name, &func.id),
                         kind: if func.id.starts_with("method_") {
                             Kind::Method
                         } else {
@@ -709,7 +1109,7 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                 for class in &fd.classes {
                     ex.nodes.push(Node {
                         id: &class.id,
-                        name: bare_name(&class.id),
+                        name: node_name(&class.name, &class.id),
                         kind: Kind::Class,
                         file: f,
                         is_entry: false,
@@ -726,7 +1126,7 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                     for m in &class.methods {
                         ex.nodes.push(Node {
                             id: &m.id,
-                            name: bare_name(&m.id),
+                            name: node_name(&m.name, &m.id),
                             kind: Kind::Method,
                             file: f,
                             is_entry: false,
@@ -809,6 +1209,7 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                     line: b.line,
                     kind: EDGE_INHERIT,
                     conditional: false,
+                    via: Via::Local,
                 })
             })
             .collect();
@@ -839,14 +1240,8 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                         continue;
                     };
                     for call in &func.calls {
-                        if let Some(to) = r.resolve_call(&call.callee, f, None, false) {
-                            buf.push(RawEdge {
-                                from,
-                                to,
-                                line: call.line as u32,
-                                kind: EDGE_CALL,
-                                conditional: call.is_conditional,
-                            });
+                        if let Some(hit) = r.resolve_call(&call.callee, f, None, false) {
+                            push_hit(&mut buf, from, hit, call);
                         }
                     }
                     flush_edges(&mut out, &mut buf);
@@ -863,15 +1258,9 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
                         // shortcut in `resolve_call`.
                         let has_self = first_self_param(&m.params);
                         for call in &m.calls {
-                            if let Some(to) = r.resolve_call(&call.callee, f, Some(cidx), has_self)
+                            if let Some(hit) = r.resolve_call(&call.callee, f, Some(cidx), has_self)
                             {
-                                buf.push(RawEdge {
-                                    from,
-                                    to,
-                                    line: call.line as u32,
-                                    kind: EDGE_CALL,
-                                    conditional: call.is_conditional,
-                                });
+                                push_hit(&mut buf, from, hit, call);
                             }
                         }
                         flush_edges(&mut out, &mut buf);
@@ -886,9 +1275,11 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
     //
     // `call_count_estimate` is the number of *resolved* call edges that
     // point at the node. It ignores inheritance edges on purpose — for
-    // "hot spot" queries what matters is callers, not subclasses.
+    // "hot spot" queries what matters is callers, not subclasses — and
+    // by-name guesses (`name`, `ambiguous`): `dict.items()` must not make
+    // the project's only `def items` a hot spot.
     let mut in_calls = vec![0u32; nodes.len()];
-    for e in &call_edges {
+    for e in call_edges.iter().filter(|e| e.via < Via::Name) {
         in_calls[e.to as usize] += 1;
     }
     let out_nodes: Vec<CallGraphNode> = nodes
@@ -921,12 +1312,37 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
             .to_string(),
             conditional: e.conditional,
             call_site_line: e.line as usize,
+            resolution: if e.kind == EDGE_INHERIT {
+                String::new()
+            } else {
+                e.via.as_str().to_string()
+            },
         })
         .collect();
 
     CallGraph {
         nodes: out_nodes,
         edges: out_edges,
+    }
+}
+
+fn push_hit(
+    buf: &mut Vec<RawEdge>,
+    from: u32,
+    hit: Hit,
+    call: &crate::struc::kb_struct::FunctionCall,
+) {
+    let edge = |to: u32, via: Via| RawEdge {
+        from,
+        to,
+        line: call.line as u32,
+        kind: EDGE_CALL,
+        conditional: call.is_conditional,
+        via,
+    };
+    match hit {
+        Hit::One(to, via) => buf.push(edge(to, via)),
+        Hit::Many(all) => buf.extend(all.into_iter().map(|to| edge(to, Via::Ambiguous))),
     }
 }
 
@@ -948,6 +1364,7 @@ pub fn populate_called_by_from_graph(kb: &mut KnowledgeBase) {
                 .get(e.from.as_str())
                 .map_or_else(String::new, |f| f.to_string()),
             line: e.call_site_line,
+            resolution: e.resolution.clone(),
         });
     }
     for fd in kb.structure.values_mut() {

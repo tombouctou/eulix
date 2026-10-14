@@ -276,6 +276,7 @@ pub fn build_call_graph(structure: &HashMap<String, FileData>) -> CallGraph {
             },
             conditional: cond,
             call_site_line: line,
+            resolution: String::new(),
         })
         .collect();
 
@@ -406,6 +407,7 @@ pub fn populate_called_by(kb: &mut KnowledgeBase) {
                                 function: func.id.clone(),
                                 file: filepath.to_string(),
                                 line: call.line,
+                                resolution: String::new(),
                             },
                         ));
                     }
@@ -421,6 +423,7 @@ pub fn populate_called_by(kb: &mut KnowledgeBase) {
                                     function: method.id.clone(),
                                     file: filepath.to_string(),
                                     line: call.line,
+                                    resolution: String::new(),
                                 },
                             ));
                         }
