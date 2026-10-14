@@ -24,9 +24,18 @@ type (
 )
 
 type CallGraphIdx struct {
-	Nodes    map[string]*utils.CallGraphNode
+	Nodes map[string]*utils.CallGraphNode
+	// Calls the parser tied to their target (import / same file / package),
+	// plus untagged edges from older indexes.
 	CalledBy map[string][]string
 	Calls    map[string][]string
+	// By-name guesses (resolution "name" / "ambiguous"), kept apart so a
+	// "who calls" answer can tell them from the exact callers.
+	CalledByName map[string][]string
+	CallsByName  map[string][]string
+	// For an ambiguous edge {from, to}: every target the same call site may
+	// mean, `to` included.
+	Candidates map[[2]string][]string
 }
 
 type FunctionNode struct {

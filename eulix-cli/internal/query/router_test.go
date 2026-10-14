@@ -788,6 +788,35 @@ func TestBuildCallGraphIndex(t *testing.T) {
 			t.Errorf("Calls = %v", idx.Calls)
 		}
 	})
+	t.Run("by-name edges are kept apart, with their candidates", func(t *testing.T) {
+		ref := &utils.CallGraphRef{}
+		fill(t, ref, M{"Edges": S{
+			resolvedEdge("func_t", "func_p", "import", 1),
+			resolvedEdge("func_u", "func_p", "ambiguous", 5),
+			resolvedEdge("func_u", "func_k", "ambiguous", 5),
+			resolvedEdge("func_v", "func_k", "name", 7),
+		}})
+		idx := BuildCallGraphIndex(ref)
+		if !reflect.DeepEqual(idx.CalledBy["func_p"], []string{"func_t"}) {
+			t.Errorf("CalledBy[p] = %v", idx.CalledBy["func_p"])
+		}
+		if !reflect.DeepEqual(idx.CalledByName["func_p"], []string{"func_u"}) {
+			t.Errorf("CalledByName[p] = %v", idx.CalledByName["func_p"])
+		}
+		if !reflect.DeepEqual(idx.CalledByName["func_k"], []string{"func_u", "func_v"}) {
+			t.Errorf("CalledByName[k] = %v", idx.CalledByName["func_k"])
+		}
+		if got := idx.Candidates[[2]string{"func_u", "func_k"}]; !reflect.DeepEqual(got, []string{"func_p", "func_k"}) {
+			t.Errorf("Candidates[u,k] = %v", got)
+		}
+		if _, ok := idx.Candidates[[2]string{"func_v", "func_k"}]; ok {
+			t.Error("a single by-name candidate has no candidate list")
+		}
+	})
+}
+
+func resolvedEdge(from, to, how string, line int) M {
+	return M{"From": from, "To": to, "EdgeType": "call", "Resolution": how, "CallSiteLine": line}
 }
 
 func TestBuildRouterCallGraph(t *testing.T) {
@@ -1052,6 +1081,59 @@ func TestHandleCallGraph(t *testing.T) {
 		r.cgIdx.mu.Unlock()
 		if got, _ := r.handleCallGraph("", cls(classifier.QueryTypeCallGraph, "a")); got != "CACHED" {
 			t.Errorf("cache not consulted: %q", got)
+		}
+	})
+	t.Run("same-named definitions each get their own callers", func(t *testing.T) {
+		r := newRouter(t)
+		r.setGraph(t, M{
+			"Nodes": S{
+				node("func_read_page::knf.py", "knf.py", "function", 1),
+				node("func_read_page::pk.py", "pk.py", "function", 2),
+				node("func_test_pk::test_pk.py", "test_pk.py", "function", 0),
+				node("func_test_knf::test_knf.py", "test_knf.py", "function", 0),
+				node("func_loose::loose.py", "loose.py", "function", 0),
+				node("func_only::only.py", "only.py", "function", 0),
+				node("func_helper::only.py", "only.py", "function", 0),
+			},
+			"Edges": S{
+				resolvedEdge("func_test_pk::test_pk.py", "func_read_page::pk.py", "import", 3),
+				resolvedEdge("func_test_knf::test_knf.py", "func_read_page::knf.py", "import", 3),
+				resolvedEdge("func_loose::loose.py", "func_read_page::pk.py", "ambiguous", 9),
+				resolvedEdge("func_loose::loose.py", "func_read_page::knf.py", "ambiguous", 9),
+				resolvedEdge("func_only::only.py", "func_read_page::pk.py", "name", 4),
+			},
+		})
+		got, _ := r.handleCallGraph("", cls(classifier.QueryTypeCallGraph, "read_page"))
+		want := lines(
+			"Note: 'read_page' is defined 2 times; callers are attributed per definition.",
+			"",
+			"Call Graph: read_page",
+			"  File    : pk.py",
+			"  Type    : function",
+			"  Metrics : Fan-in 1 | Fan-out 0 | by name only: 2 in, 0 out",
+			"",
+			"┌── Called by (Inbound):",
+			"│   ← test_pk",
+			"├── Called by name, possibly (no import ties the call to this definition):",
+			"│   ? loose  (loose.py) — one of 2 same-named definitions; also knf.py",
+			"│   ? only  (only.py) — only definition with this name",
+			"└── Calls (Outbound):",
+			"    (none — leaf function)",
+			"",
+			"Call Graph: read_page",
+			"  File    : knf.py",
+			"  Type    : function",
+			"  Metrics : Fan-in 1 | Fan-out 0 | by name only: 1 in, 0 out",
+			"",
+			"┌── Called by (Inbound):",
+			"│   ← test_knf",
+			"├── Called by name, possibly (no import ties the call to this definition):",
+			"│   ? loose  (loose.py) — one of 2 same-named definitions; also pk.py",
+			"└── Calls (Outbound):",
+			"    (none — leaf function)",
+		)
+		if got != want {
+			t.Errorf("got:\n%s\nwant:\n%s", got, want)
 		}
 	})
 	t.Run("concurrent use is race-free and consistent", func(t *testing.T) {

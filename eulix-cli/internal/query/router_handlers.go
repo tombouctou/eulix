@@ -255,7 +255,7 @@ func buildRouterCallGraph(ref *utils.CallGraphRef) *callGraph {
 	}
 
 	for _, e := range ref.Edges {
-		if e.EdgeType != "call" {
+		if e.EdgeType != "call" || e.Resolution == "ambiguous" {
 			continue
 		}
 		from := bareID(e.From)
@@ -343,62 +343,21 @@ func (r *Router) handleCallGraph(query string, class *c.Classification) (string,
 		return fmt.Sprintf("'%s' not found in call graph.", entity), nil
 	}
 
-	// Lookup core body from cache or render it if cache miss
-	var body string
-	r.cgIdx.mu.RLock()
-	cached, hit := r.cgIdx.cache[resolvedKey]
-	r.cgIdx.mu.RUnlock()
-
-	if hit {
-		body = cached
-	} else {
-		callers := r.cgBuild.CalledBy[resolvedKey]
-		callees := r.cgBuild.Calls[resolvedKey]
-
-		var b strings.Builder
-		b.Grow(2048)
-
-		fmt.Fprintf(&b, "Call Graph: %s\n", bareID(resolvedKey))
-		fmt.Fprintf(&b, "  File    : %s\n", node.File)
-		fmt.Fprintf(&b, "  Type    : %s\n", node.NodeType)
-		if node.IsEntryPoint {
-			b.WriteString("  Role    : entry point\n")
+	// Several definitions share the exact name (two adapters each with a
+	// `read_page`): the parser attributes callers per definition, so show
+	// every one of them rather than the busiest alone.
+	if same := r.sameNameDefinitions(entity, ambiguous); len(same) > 1 && len(same) <= maxSameNameShown {
+		var result strings.Builder
+		fmt.Fprintf(&result, "Note: '%s' is defined %d times; callers are attributed per definition.\n",
+			entity, len(same))
+		for _, k := range same {
+			result.WriteString("\n")
+			result.WriteString(r.callGraphBody(k, r.cgBuild.Nodes[k]))
 		}
-		fmt.Fprintf(&b, "  Metrics : Fan-in %d | Fan-out %d\n", len(callers), len(callees))
-
-		b.WriteString("\n┌── Called by (Inbound):\n")
-		if len(callers) == 0 {
-			b.WriteString("│   (none — likely an entry point or exported API)\n")
-		} else {
-			for _, callerID := range callers {
-				fmt.Fprintf(&b, "│   ← %s\n", bareID(callerID))
-				for _, gc := range r.cgBuild.CalledBy[callerID] {
-					fmt.Fprintf(&b, "│       ← %s\n", bareID(gc))
-				}
-			}
-		}
-
-		b.WriteString("└── Calls (Outbound):\n")
-		if len(callees) == 0 {
-			b.WriteString("    (none — leaf function)\n")
-		} else {
-			for _, callee := range callees {
-				fmt.Fprintf(&b, "    → %s\n", bareID(callee))
-				for _, gc := range r.cgBuild.Calls[callee] {
-					fmt.Fprintf(&b, "        → %s\n", bareID(gc))
-				}
-			}
-		}
-
-		if len(callees) > 7 {
-			fmt.Fprintf(&b, "\n⚠ High fan-out (%d) — consider splitting.\n", len(callees))
-		}
-
-		body = b.String()
-		r.cgIdx.mu.Lock()
-		r.cgIdx.cache[resolvedKey] = body
-		r.cgIdx.mu.Unlock()
+		return result.String(), nil
 	}
+
+	body := r.callGraphBody(resolvedKey, node)
 
 	// Build the final response, prepending ambiguity note dynamically if present
 	if len(ambiguous) <= 1 {
@@ -426,6 +385,138 @@ func (r *Router) handleCallGraph(query string, class *c.Classification) (string,
 	result.WriteString(body)
 
 	return result.String(), nil
+}
+
+// maxSameNameShown caps how many same-named definitions one answer renders.
+const maxSameNameShown = 4
+
+// sameNameDefinitions returns the matched keys whose short name is exactly
+// `entity` (prefix-only matches dropped), busiest first, then by key.
+func (r *Router) sameNameDefinitions(entity string, matched []string) []string {
+	lower := strings.ToLower(entity)
+	var out []string
+	for _, k := range matched {
+		if strings.ToLower(callGraphShortName(k)) == lower || strings.ToLower(bareID(k)) == lower {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ni, nj := r.cgBuild.Nodes[out[i]], r.cgBuild.Nodes[out[j]]
+		if ni.CallCountEstimate != nj.CallCountEstimate {
+			return ni.CallCountEstimate > nj.CallCountEstimate
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+// callGraphBody renders (and caches) the two-level tree for one node.
+// Exact callers come first; callers the parser matched by bare name only
+// are listed apart, as "possibly", with the other candidates of an
+// ambiguous call.
+func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
+	r.cgIdx.mu.RLock()
+	cached, hit := r.cgIdx.cache[key]
+	r.cgIdx.mu.RUnlock()
+	if hit {
+		return cached
+	}
+
+	callers := r.cgBuild.CalledBy[key]
+	callees := r.cgBuild.Calls[key]
+	guessedCallers := r.cgBuild.CalledByName[key]
+	guessedCallees := r.cgBuild.CallsByName[key]
+
+	var b strings.Builder
+	b.Grow(2048)
+
+	fmt.Fprintf(&b, "Call Graph: %s\n", bareID(key))
+	fmt.Fprintf(&b, "  File    : %s\n", node.File)
+	fmt.Fprintf(&b, "  Type    : %s\n", node.NodeType)
+	if node.IsEntryPoint {
+		b.WriteString("  Role    : entry point\n")
+	}
+	fmt.Fprintf(&b, "  Metrics : Fan-in %d | Fan-out %d", len(callers), len(callees))
+	if len(guessedCallers)+len(guessedCallees) > 0 {
+		fmt.Fprintf(&b, " | by name only: %d in, %d out", len(guessedCallers), len(guessedCallees))
+	}
+	b.WriteString("\n")
+
+	b.WriteString("\n┌── Called by (Inbound):\n")
+	if len(callers) == 0 {
+		if len(guessedCallers) == 0 {
+			b.WriteString("│   (none — likely an entry point or exported API)\n")
+		} else {
+			b.WriteString("│   (none tied by an import or the same file)\n")
+		}
+	} else {
+		for _, callerID := range callers {
+			fmt.Fprintf(&b, "│   ← %s\n", bareID(callerID))
+			for _, gc := range r.cgBuild.CalledBy[callerID] {
+				fmt.Fprintf(&b, "│       ← %s\n", bareID(gc))
+			}
+		}
+	}
+	if len(guessedCallers) > 0 {
+		b.WriteString("├── Called by name, possibly (no import ties the call to this definition):\n")
+		for _, callerID := range guessedCallers {
+			fmt.Fprintf(&b, "│   ? %s  (%s)%s\n", bareID(callerID), r.fileOf(callerID),
+				r.candidateNote(callerID, key))
+		}
+	}
+
+	b.WriteString("└── Calls (Outbound):\n")
+	if len(callees) == 0 {
+		b.WriteString("    (none — leaf function)\n")
+	} else {
+		for _, callee := range callees {
+			fmt.Fprintf(&b, "    → %s\n", bareID(callee))
+			for _, gc := range r.cgBuild.Calls[callee] {
+				fmt.Fprintf(&b, "        → %s\n", bareID(gc))
+			}
+		}
+	}
+	for _, callee := range guessedCallees {
+		fmt.Fprintf(&b, "    ? %s  (%s, by name)%s\n", bareID(callee), r.fileOf(callee),
+			r.candidateNote(key, callee))
+	}
+
+	if len(callees) > 7 {
+		fmt.Fprintf(&b, "\n⚠ High fan-out (%d) — consider splitting.\n", len(callees))
+	}
+
+	body := b.String()
+	r.cgIdx.mu.Lock()
+	r.cgIdx.cache[key] = body
+	r.cgIdx.mu.Unlock()
+	return body
+}
+
+func (r *Router) fileOf(id string) string {
+	if n, ok := r.cgBuild.Nodes[id]; ok && n.File != "" {
+		return n.File
+	}
+	if i := strings.LastIndex(id, "::"); i >= 0 {
+		return id[i+2:]
+	}
+	return "?"
+}
+
+// candidateNote says, for a by-name edge from -> to, whether `to` was the
+// only candidate or one of several (and which).
+func (r *Router) candidateNote(from, to string) string {
+	cands := r.cgBuild.Candidates[[2]string{from, to}]
+	if len(cands) <= 1 {
+		return " — only definition with this name"
+	}
+	others := make([]string, 0, len(cands)-1)
+	for _, c := range cands {
+		if c != to {
+			others = append(others, r.fileOf(c))
+		}
+	}
+	sort.Strings(others)
+	return fmt.Sprintf(" — one of %d same-named definitions; also %s", len(cands), strings.Join(others, ", "))
 }
 
 // Match standalone project-level keywords using word boundaries

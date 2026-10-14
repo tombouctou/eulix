@@ -133,9 +133,10 @@ type FunctionCall struct {
 }
 
 type CallerInfo struct {
-	Function string `json:"function"`
-	File     string `json:"file"`
-	Line     int    `json:"line"`
+	Function   string `json:"function"`
+	File       string `json:"file"`
+	Line       int    `json:"line"`
+	Resolution string `json:"resolution,omitempty"`
 }
 
 type Variable struct {
@@ -260,6 +261,17 @@ type CallGraphEdge struct {
 	EdgeType     string `json:"edge_type"`
 	Conditional  bool   `json:"conditional"`
 	CallSiteLine int    `json:"call_site_line"`
+	// How the parser tied the call to its target (PRISM v2): "import",
+	// "local", "package" — tied by the caller's code; "name" — by bare name,
+	// the only candidate; "ambiguous" — by bare name, one of several (the
+	// caller then has one such edge per candidate). Empty on older indexes.
+	Resolution string `json:"resolution,omitempty"`
+}
+
+// ByNameOnly reports a call edge the parser could not tie to its target
+// through an import or locality — a guess from the bare name.
+func (e *CallGraphEdge) ByNameOnly() bool {
+	return e.Resolution == "name" || e.Resolution == "ambiguous"
 }
 
 type DependencyGraph struct {

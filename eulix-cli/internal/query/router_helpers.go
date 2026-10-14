@@ -717,16 +717,22 @@ func (r *Router) resolveCallGraphEntity(name string) (string, *utils.CallGraphNo
 func BuildCallGraphIndex(ref *utils.CallGraphRef) *retrieval.CallGraphIdx {
 	if ref == nil {
 		return &retrieval.CallGraphIdx{
-			Nodes:    make(map[string]*utils.CallGraphNode),
-			CalledBy: make(map[string][]string),
-			Calls:    make(map[string][]string),
+			Nodes:        make(map[string]*utils.CallGraphNode),
+			CalledBy:     make(map[string][]string),
+			Calls:        make(map[string][]string),
+			CalledByName: make(map[string][]string),
+			CallsByName:  make(map[string][]string),
+			Candidates:   make(map[[2]string][]string),
 		}
 	}
 
 	idx := &retrieval.CallGraphIdx{
-		Nodes:    make(map[string]*utils.CallGraphNode, len(ref.Nodes)),
-		CalledBy: make(map[string][]string, len(ref.Nodes)),
-		Calls:    make(map[string][]string, len(ref.Nodes)),
+		Nodes:        make(map[string]*utils.CallGraphNode, len(ref.Nodes)),
+		CalledBy:     make(map[string][]string, len(ref.Nodes)),
+		Calls:        make(map[string][]string, len(ref.Nodes)),
+		CalledByName: make(map[string][]string),
+		CallsByName:  make(map[string][]string),
+		Candidates:   make(map[[2]string][]string),
 	}
 
 	for i := range ref.Nodes {
@@ -734,19 +740,65 @@ func BuildCallGraphIndex(ref *utils.CallGraphRef) *retrieval.CallGraphIdx {
 		idx.Nodes[n.ID] = n
 	}
 
-	for _, e := range ref.Edges {
-		if e.EdgeType == "call" {
-			idx.Calls[e.From] = append(idx.Calls[e.From], e.To)
-			idx.CalledBy[e.To] = append(idx.CalledBy[e.To], e.From)
+	type site struct {
+		from string
+		line int
+	}
+	sites := map[site][]string{}
+	for i := range ref.Edges {
+		e := &ref.Edges[i]
+		if e.EdgeType != "call" {
+			continue
+		}
+		if e.ByNameOnly() {
+			idx.CallsByName[e.From] = append(idx.CallsByName[e.From], e.To)
+			idx.CalledByName[e.To] = append(idx.CalledByName[e.To], e.From)
+			if e.Resolution == "ambiguous" {
+				k := site{e.From, e.CallSiteLine}
+				sites[k] = append(sites[k], e.To)
+			}
+			continue
+		}
+		idx.Calls[e.From] = append(idx.Calls[e.From], e.To)
+		idx.CalledBy[e.To] = append(idx.CalledBy[e.To], e.From)
+	}
+	for k, tos := range sites {
+		for _, to := range tos {
+			key := [2]string{k.from, to}
+			idx.Candidates[key] = dedupStrings(append(idx.Candidates[key], tos...))
 		}
 	}
-	for id, callers := range idx.CalledBy {
-		idx.CalledBy[id] = dedupStrings(callers)
+	for _, m := range []map[string][]string{idx.CalledBy, idx.Calls, idx.CalledByName, idx.CallsByName} {
+		for id, v := range m {
+			m[id] = dedupStrings(v)
+		}
 	}
-	for id, callees := range idx.Calls {
-		idx.Calls[id] = dedupStrings(callees)
+	// A caller both tied and guessed (two call sites) is an exact caller.
+	for to, callers := range idx.CalledByName {
+		idx.CalledByName[to] = without(callers, idx.CalledBy[to])
+	}
+	for from, callees := range idx.CallsByName {
+		idx.CallsByName[from] = without(callees, idx.Calls[from])
 	}
 	return idx
+}
+
+// without returns xs minus every element of drop, order kept.
+func without(xs, drop []string) []string {
+	if len(drop) == 0 {
+		return xs
+	}
+	skip := make(map[string]struct{}, len(drop))
+	for _, d := range drop {
+		skip[d] = struct{}{}
+	}
+	out := xs[:0:0]
+	for _, x := range xs {
+		if _, ok := skip[x]; !ok {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // callGraphShortName extracts the bare symbol name from a prefixed/namespaced key.

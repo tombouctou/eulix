@@ -333,7 +333,9 @@ func (cb *ContextBuilder) loadAndIndexCallGraph() {
 
 	cb.callGraph = make(map[string][]Relationship, len(cg.Nodes))
 	for _, e := range cg.Edges {
-		if e.EdgeType != "call" {
+		// An ambiguous edge is one of several guesses for the same call:
+		// it would pull unrelated code into the context.
+		if e.EdgeType != "call" || e.Resolution == "ambiguous" {
 			continue
 		}
 		cb.callGraph[e.From] = append(cb.callGraph[e.From],
