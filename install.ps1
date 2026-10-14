@@ -4,7 +4,7 @@
 .SYNOPSIS
     Eulix installer for Windows 10/11 (64-bit).
 .DESCRIPTION
-    Downloads the latest Eulix release binary and vizEulize.html UI,
+    Downloads the latest Eulix release binary and vizeulize.html UI,
     verifies their checksums, installs them, sets up a Python venv via uv,
     and triggers first-run self-extraction of the embedded parser + eulix_embed.
 #>
@@ -24,7 +24,7 @@ $EulixBinDir       = Join-Path $EulixDir 'bin'
 $EulixVenv         = Join-Path $EulixDir '.venv'
 $EulixParserPath   = Join-Path $EulixBinDir 'eulix_parser.exe'
 $EulixEmbedPath    = Join-Path $EulixDir 'eulix_embed'
-$VizEulizeHtmlPath = Join-Path $EulixBinDir 'vizEulize.html'
+$vizeulizeHtmlPath = Join-Path $EulixBinDir 'vizeulize.html'
 
 $Repo         = 'Nurysso/eulix'
 $ReleaseTag   = 'v0.8.2'
@@ -156,10 +156,10 @@ function Get-Checksum {
     return $null
 }
 
-# Download the release binary and vizEulize.html, verify checksums, install them
+# Download the release binary and vizeulize.html, verify checksums, install them
 function Download-Binary {
     $script:AssetName = "eulix-windows-amd64-onnx-$GpuVariant.exe"
-    $htmlAssetName   = "vizEulize.html"
+    $htmlAssetName   = "vizeulize.html"
 
     $assetUrl        = "$ReleaseBase/$AssetName"
     $htmlUrl         = "$ReleaseBase/$htmlAssetName"
@@ -205,7 +205,7 @@ function Download-Binary {
         Success "Binary checksum verified."
     }
 
-    # Verify vizEulize.html checksum (matches 'vizEulize/vizEulize.html' in checksums.txt)
+    # Verify vizeulize.html checksum (matches 'vizeulize/vizeulize.html' in checksums.txt)
     $expectedHtml = Get-Checksum -TargetFilename $htmlAssetName -ChecksumsFile$tmpChecksums
     if (-not $expectedHtml) {
         Warn "Could not find $htmlAssetName in checksums.txt - skipping HTML verification."
@@ -215,7 +215,7 @@ function Download-Binary {
             Remove-Item -Force $tmpBin, $tmpHtml,$tmpChecksums -ErrorAction SilentlyContinue
             Die "Checksum mismatch for $htmlAssetName! Expected $expectedHtml, got$actualHtml."
         }
-        Success "vizEulize.html checksum verified."
+        Success "vizeulize.html checksum verified."
     }
 
     Remove-Item -Force $tmpChecksums -ErrorAction SilentlyContinue
@@ -226,10 +226,10 @@ function Download-Binary {
     Move-Item -Force -Path $tmpBin -Destination$destPath
     Success "Installed binary -> $destPath"
 
-    # Install vizEulize.html into %USERPROFILE%\.Eulix\bin\
+    # Install vizeulize.html into %USERPROFILE%\.Eulix\bin\
     New-Item -ItemType Directory -Force -Path $EulixBinDir | Out-Null
-    Move-Item -Force -Path $tmpHtml -Destination$VizEulizeHtmlPath
-    Success "Installed UI webapp -> $VizEulizeHtmlPath"
+    Move-Item -Force -Path $tmpHtml -Destination$vizeulizeHtmlPath
+    Success "Installed UI webapp -> $vizeulizeHtmlPath"
 }
 
 # Trigger first-run self-extraction (unpacks embedded parser + eulix_embed)
@@ -289,7 +289,7 @@ function Main {
     Write-Host "  Venv          : $EulixVenv"
     Write-Host "  eulix_parser  : $EulixParserPath"
     Write-Host "  eulix_embed   : $EulixEmbedPath"
-    Write-Host "  vizEulize.html: $VizEulizeHtmlPath"
+    Write-Host "  vizeulize.html: $vizeulizeHtmlPath"
     Write-Host "  Run           : eulix --help"
     Write-Host ""
 }
