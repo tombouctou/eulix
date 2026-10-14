@@ -230,15 +230,12 @@ pub struct ParseFailure(pub String);
 
 // Language support
 
-// Extensions libeulix can actually parse.
-//
-// Note the absences: `Language::detect` maps `.jsx`/`.tsx` to
-// `Language::Jsx`/`Language::Tsx`, but `parse_source` has no arm for either
-// and falls through to `Err("Unsupported language: …")`. They're excluded
-// here so the server never offers features it can't back up.
+// Extensions libeulix can actually parse — and only those, so the server
+// never offers features it can't back up. `.jsx` goes to the JavaScript
+// grammar and `.tsx` to TypeScript's TSX one (libeulix `parse_source`).
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "h++", "c++", "cs", "go", "java", "js", "mjs", "cjs",
-    "py", "pyw", "pyi", "rs", "ts", "mts", "cts",
+    "c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "h++", "c++", "cs", "go", "java", "js", "jsx",
+    "mjs", "cjs", "py", "pyw", "pyi", "rs", "ts", "tsx", "mts", "cts",
 ];
 
 pub fn is_supported(path: &Path) -> bool {
@@ -491,12 +488,31 @@ mod tests {
     }
 
     #[test]
-    fn jsx_is_reported_unsupported_rather_than_pretending() {
-        // libeulix detects .jsx but has no parse_source arm for it.
-        let err = parse(Path::new("App.jsx"), "export default function App() {}");
+    #[allow(clippy::expect_used)]
+    fn jsx_and_tsx_parse_into_symbols() {
+        // libeulix parses both since it learnt React files: a component is
+        // a function, whichever grammar reads it.
+        for (path, label) in [("App.jsx", "javascript"), ("App.tsx", "typescript")] {
+            let parsed = parse(
+                Path::new(path),
+                "export default function App() { return <Row />; }",
+            )
+            .expect("react file should parse");
+            assert_eq!(parsed.language, label);
+            assert!(
+                parsed.functions.iter().any(|f| f.name == "App"),
+                "{path}: {:?}",
+                parsed.functions
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_language_is_reported_unsupported_rather_than_pretending() {
+        let err = parse(Path::new("notes.md"), "# title");
         assert!(
             err.is_err(),
-            "jsx must surface as unsupported, not as empty success"
+            "an unparseable language must surface as an error, not as empty success"
         );
     }
 
@@ -518,7 +534,8 @@ mod tests {
     fn unsupported_extension_predicate_matches_detect() {
         assert!(is_supported(Path::new("a.rs")));
         assert!(is_supported(Path::new("a.PY")));
-        assert!(!is_supported(Path::new("a.jsx")));
+        assert!(is_supported(Path::new("a.jsx")));
+        assert!(is_supported(Path::new("a.TSX")));
         assert!(!is_supported(Path::new("a.md")));
     }
 }

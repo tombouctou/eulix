@@ -235,9 +235,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("good.rs"), "fn alpha() {}").unwrap();
-        fs::write(root.join("bad.jsx"), "export default function App() {}").unwrap();
+        fs::write(root.join("bad.md"), "# not code").unwrap();
 
-        let paths = vec![root.join("good.rs"), root.join("bad.jsx")];
+        let paths = vec![root.join("good.rs"), root.join("bad.md")];
         let cancel = Arc::new(AtomicBool::new(false));
         let (ok, failed) = parse_all(paths, cfg(), cancel, |_| {}).await;
 
