@@ -42,6 +42,10 @@ type ParserConfig struct {
 }
 
 type EmbeddingsConfig struct {
+	// Enabled = false runs eulix without the Python embedder: analyze
+	// stops after the parser and retrieval falls back to lexical + call
+	// graph search. The EULIX_NO_EMBEDDINGS env var forces it off.
+	Enabled   bool   `toml:"enabled"`
 	Model     string `toml:"model"`
 	Dimension int    `toml:"dimension"`
 	Engine    string `toml:"engine"`
@@ -192,8 +196,28 @@ func Load() (*Config, error) {
 	if cfg.LLM.APIKey == "" {
 		cfg.LLM.APIKey = resolveAPIKeyFromEnv(cfg.LLM.Provider)
 	}
+	applyEmbeddingsEnv(&cfg)
 
 	return &cfg, nil
+}
+
+// NoEmbeddingsEnv, when set to a truthy value, disables the embedder
+// regardless of eulix.toml. `--no-embeddings` on analyze/mcp sets it.
+const NoEmbeddingsEnv = "EULIX_NO_EMBEDDINGS"
+
+// NoEmbeddingsFromEnv reports whether NoEmbeddingsEnv is set to a truthy value.
+func NoEmbeddingsFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(NoEmbeddingsEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+func applyEmbeddingsEnv(cfg *Config) {
+	if NoEmbeddingsFromEnv() {
+		cfg.Embeddings.Enabled = false
+	}
 }
 
 // LoadFrom loads and validates the configuration from a specific project repository directory.
@@ -214,6 +238,7 @@ func LoadFrom(repoDir string) (*Config, error) {
 	if cfg.LLM.APIKey == "" {
 		cfg.LLM.APIKey = resolveAPIKeyFromEnv(cfg.LLM.Provider)
 	}
+	applyEmbeddingsEnv(&cfg)
 
 	return &cfg, nil
 }
@@ -236,6 +261,7 @@ func DefaultConfig() *Config {
 			Verbose: true,
 		},
 		Embeddings: EmbeddingsConfig{
+			Enabled:   true,
 			Model:     "BAAI/bge-base-en-v1.5",
 			Dimension: 768,
 			Engine:    "onnx",

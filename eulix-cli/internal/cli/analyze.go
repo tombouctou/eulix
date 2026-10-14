@@ -88,6 +88,12 @@ func analyzeProject(projectPath string) error {
 	}
 	fmt.Println("✓ Parser completed")
 
+	if !cfg.Embeddings.Enabled {
+		fmt.Println("Embeddings disabled – skipping eulix_embed (lexical + call-graph retrieval only)")
+		fmt.Printf("Took %s\n", time.Since(startTime).Round(time.Millisecond))
+		return nil
+	}
+
 	fmt.Println("Generating embeddings...")
 	venvPath := filepath.Join(globalRoot, utils.VenvSubDir)
 	pythonPath, venvEnv, err := embeddings.GetVenvPython(venvPath)

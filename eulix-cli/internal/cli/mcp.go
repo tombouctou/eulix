@@ -45,6 +45,9 @@ Communication modes:
   - query_without_cot: clean context without Chain-of-Thought headers`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := applyNoEmbeddingsFlag(cmd); err != nil {
+			return err
+		}
 		targetRepo := mcpRepoPath
 		if len(args) > 0 {
 			targetRepo = args[0]
@@ -76,5 +79,6 @@ Communication modes:
 func init() {
 	mcpCmd.Flags().StringVar(&mcpRepoPath, "repo", "", "Initial repository path to query (optional; can also be set dynamically by AI agents)")
 	mcpCmd.Flags().DurationVar(&mcpIdleTimeout, "timeout", mcp.DefaultIdleTimeout, "Idle timeout before releasing context builder from memory (e.g. 5m, 10m)")
+	mcpCmd.Flags().Bool(noEmbeddingsFlag, false, "Serve lexical + call-graph retrieval without starting the Python embedder")
 	mcpCmd.Flags().BoolVar(&mcpDefaultCoT, "cot", false, "Default to Chain-of-Thought headers when 'include_cot' is not specified")
 }

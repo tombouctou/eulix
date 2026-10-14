@@ -98,6 +98,9 @@ var analyzeCmd = &cobra.Command{
 	Short: "Analyze codebase and generate knowledge base",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := applyNoEmbeddingsFlag(cmd); err != nil {
+			return err
+		}
 		root, err := a.EulixRoot()
 		if err != nil {
 			return err
@@ -611,6 +614,20 @@ func setupFlags() {
 
 	// history flags
 	historyCmd.Flags().Bool("no-tui", false, "Use plain-text output instead of the TUI")
+
+	analyzeCmd.Flags().Bool(noEmbeddingsFlag, false, "Skip the Python embedder; build only the knowledge base and call graph")
+}
+
+const noEmbeddingsFlag = "no-embeddings"
+
+// applyNoEmbeddingsFlag turns --no-embeddings into EULIX_NO_EMBEDDINGS=1 so
+// every later config.Load / config.LoadFrom in this process honours it.
+func applyNoEmbeddingsFlag(cmd *cobra.Command) error {
+	off, err := cmd.Flags().GetBool(noEmbeddingsFlag)
+	if err != nil || !off {
+		return err
+	}
+	return os.Setenv(config.NoEmbeddingsEnv, "1")
 }
 
 func setupHistoryCommands() {

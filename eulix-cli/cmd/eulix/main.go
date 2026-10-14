@@ -28,6 +28,7 @@ import (
 
 	a "eulix/internal/assets"
 	"eulix/internal/cli"
+	"eulix/internal/config"
 )
 
 func init() {
@@ -41,8 +42,10 @@ func init() {
 		log.Fatalf("eulix: %v", err)
 	}
 
-	// Only run setup if not already initialized
-	if !a.IsInitialized() {
+	// Only run setup if not already initialized. Lexical + call-graph mode
+	// (--no-embeddings / EULIX_NO_EMBEDDINGS=1) never touches Python, so it
+	// skips the venv check and the dependency install altogether.
+	if !a.IsInitialized() && !embeddingsDisabled() {
 		if err := a.CheckUv(); err != nil {
 			log.Fatalf("eulix: %v", err)
 		}
@@ -59,6 +62,23 @@ func init() {
 			log.Fatalf("eulix: %v", err)
 		}
 	}
+}
+
+// embeddingsDisabled reports whether this run opted out of the embedder.
+// It runs before cobra parses flags, so it scans os.Args itself.
+func embeddingsDisabled() bool {
+	if config.NoEmbeddingsFromEnv() {
+		return true
+	}
+	for _, arg := range os.Args[1:] {
+		if arg == "--" {
+			break
+		}
+		if arg == "--no-embeddings" || arg == "--no-embeddings=true" {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {

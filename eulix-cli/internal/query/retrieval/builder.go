@@ -39,13 +39,17 @@ func ContextWindowCreator(eulixDir string, cfg *config.Config, llmClient *llm.Cl
 	// Start auto-flush every 5 seconds
 	cb.debugLog.StartAutoFlush(5 * time.Second)
 
-	queryEmbedder, err := embeddings.VectorWeaver(cfg.Embeddings.Model, cfg.Embeddings.Debug)
-	if err != nil {
-		cb.debugLog.Log("Failed to initialize embedder: %v", err)
-		cb.debugLog.Close()
-		return nil, fmt.Errorf("failed to initialize embedder: %w", err)
+	if cfg.Embeddings.Enabled {
+		queryEmbedder, err := embeddings.VectorWeaver(cfg.Embeddings.Model, cfg.Embeddings.Debug)
+		if err != nil {
+			cb.debugLog.Log("Failed to initialize embedder: %v", err)
+			cb.debugLog.Close()
+			return nil, fmt.Errorf("failed to initialize embedder (set [embeddings] enabled = false or %s=1 for lexical + graph only): %w", config.NoEmbeddingsEnv, err)
+		}
+		cb.queryEmbedder = queryEmbedder
+	} else {
+		cb.debugLog.Log("Embeddings disabled: lexical + call-graph retrieval only")
 	}
-	cb.queryEmbedder = queryEmbedder
 
 	if err := cb.loadChunks(); err != nil {
 		cb.debugLog.Log("Failed to load chunks: %v", err)
@@ -53,7 +57,9 @@ func ContextWindowCreator(eulixDir string, cfg *config.Config, llmClient *llm.Cl
 		return nil, fmt.Errorf("failed to load chunks from KB: %w", err)
 	}
 
-	if err := cb.loadEmbeddings(); err != nil {
+	if cb.queryEmbedder == nil {
+		cb.hasEmbeddings = false
+	} else if err := cb.loadEmbeddings(); err != nil {
 		cb.debugLog.Log("Embeddings not loaded: %v", err)
 		cb.hasEmbeddings = false
 	} else {

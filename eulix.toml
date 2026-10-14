@@ -11,6 +11,9 @@ prismVersion = 2
 verbose = true
 
 [embeddings]
+# false = no Python embedder: analyze stops after the parser and
+# query/mcp use lexical + call-graph retrieval only (same as --no-embeddings)
+enabled = true
 model = "BAAI/bge-base-en-v1.5"
 dimension = 768
 engine = "torch"
