@@ -183,6 +183,7 @@ impl RustParser {
                     module,
                     items: vec![],
                     import_type,
+                    ..Default::default()
                 });
             } else {
                 self.collect_use_declarations(&child, imports);

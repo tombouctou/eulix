@@ -161,17 +161,12 @@ impl TypeScriptParser {
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            let target = if child.kind() == "export_statement" {
-                child
-                    .children(&mut child.walk())
-                    .find(|c| c.kind() == "import_statement")
-                    .unwrap_or(child)
-            } else {
-                child
-            };
-
-            if target.kind() == "import_statement" {
-                self.parse_import_statement(&target, &mut imports);
+            match child.kind() {
+                "import_statement" => self.parse_import_statement(&child, &mut imports),
+                // `export { a, b as c } from "./x"` / `export * from "./x"`:
+                // a barrel file re-exports, and the resolver follows it.
+                "export_statement" => self.parse_import_statement(&child, &mut imports),
+                _ => {}
             }
         }
 
@@ -190,49 +185,68 @@ impl TypeScriptParser {
             .unwrap_or_default();
 
         if module.is_empty() {
+            // `export function f() {}` / `export import x = ...`
+            let mut c = node.walk();
+            let inner = node
+                .children(&mut c)
+                .find(|c| c.kind() == "import_statement");
+            if let Some(inner) = inner {
+                self.parse_import_statement(&inner, imports);
+            }
             return;
         }
 
-        let mut items: Vec<String> = Vec::new();
-        self.collect_import_names(node, &mut items);
-
-        let import_type = self.classify_import(&module);
-        imports.push(Import {
+        let mut imp = Import {
+            import_type: self.classify_import(&module),
             module,
-            items,
-            import_type,
-        });
+            ..Default::default()
+        };
+        self.collect_import_names(node, &mut imp);
+        imports.push(imp);
     }
 
     /// Local names an import binds: `Default`, `{ A, B as C }` -> `A`, `C`,
     /// `* as ns` -> `ns`. These are the names the call-graph resolver sees
-    /// at call sites, so they must not be the raw clause text.
-    fn collect_import_names(&self, node: &Node, items: &mut Vec<String>) {
+    /// at call sites, so they must not be the raw clause text. A rename is
+    /// also kept in `renamed` (`C` -> `B`), a namespace in `alias`.
+    /// `export * from` binds nothing locally but re-exports everything: `*`.
+    fn collect_import_names(&self, node: &Node, imp: &mut Import) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
-                "import_clause" => self.collect_import_names(&child, items),
-                "identifier" => items.push(self.get_node_text(&child)),
-                "namespace_import" => {
+                "import_clause" => self.collect_import_names(&child, imp),
+                "identifier" => imp.items.push(self.get_node_text(&child)),
+                "*" if node.kind() == "export_statement" => imp.items.push("*".to_string()),
+                "namespace_import" | "namespace_export" => {
                     let mut nc = child.walk();
                     let id = child
                         .named_children(&mut nc)
                         .find(|c| c.kind() == "identifier");
                     if let Some(id) = id {
-                        items.push(self.get_node_text(&id));
+                        let ns = self.get_node_text(&id);
+                        imp.items.push(ns.clone());
+                        imp.alias = Some(ns);
                     }
                 }
-                "named_imports" => {
+                "named_imports" | "export_clause" => {
                     let mut nc = child.walk();
                     for spec in child.named_children(&mut nc) {
-                        if spec.kind() != "import_specifier" {
+                        if spec.kind() != "import_specifier" && spec.kind() != "export_specifier" {
                             continue;
                         }
-                        let local = spec
+                        let name = spec
+                            .child_by_field_name("name")
+                            .map(|n| self.get_node_text(&n));
+                        let alias = spec
                             .child_by_field_name("alias")
-                            .or_else(|| spec.child_by_field_name("name"));
-                        if let Some(n) = local {
-                            items.push(self.get_node_text(&n));
+                            .map(|n| self.get_node_text(&n));
+                        match (name, alias) {
+                            (Some(name), Some(alias)) => {
+                                imp.items.push(alias.clone());
+                                imp.renamed.push((alias, name));
+                            }
+                            (Some(name), None) => imp.items.push(name),
+                            _ => {}
                         }
                     }
                 }

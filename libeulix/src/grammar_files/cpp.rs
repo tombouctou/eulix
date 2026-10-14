@@ -604,6 +604,7 @@ impl CppParser {
                             module: path.clone(),
                             items: vec![],
                             import_type: self.classify_import(&path, is_system),
+                            ..Default::default()
                         });
                     }
                 }

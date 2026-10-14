@@ -294,6 +294,7 @@ impl JsParser {
                             import_type: self.classify_import(&source),
                             module: source,
                             items,
+                            ..Default::default()
                         });
                     }
                 }
@@ -304,6 +305,7 @@ impl JsParser {
                             import_type: self.classify_import(&source),
                             module: source,
                             items: vec![],
+                            ..Default::default()
                         });
                     }
                     self.walk_top_level_imports(&child, imports);
@@ -380,6 +382,7 @@ impl JsParser {
                                     import_type: self.classify_import(&source),
                                     module: source,
                                     items: vec![],
+                                    ..Default::default()
                                 });
                             }
                         }

@@ -36,7 +36,9 @@ pub fn strip_emitted(fd: &mut FileData) {
 pub fn slim(fd: &mut FileData) {
     fd.global_vars = Vec::new();
     fd.security_notes = Vec::new();
-    fd.imports = Vec::new();
+    // Imports stay: PRISM v2 resolves calls through them. Dropping them here
+    // left every call to be matched by bare name. They are small next to the
+    // functions, and kb.json does not carry them (see views.rs).
     fd.imports.shrink_to_fit();
     fd.functions.iter_mut().for_each(strip_fn);
     for c in &mut fd.classes {

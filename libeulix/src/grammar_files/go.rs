@@ -147,6 +147,7 @@ impl GoParser {
                                 module: path.clone(),
                                 items: if let Some(a) = alias { vec![a] } else { vec![] },
                                 import_type: self.classify_import(&path),
+                                ..Default::default()
                             });
                         }
                     } else if spec_node.kind() == "import_spec_list" {
@@ -163,6 +164,7 @@ impl GoParser {
                                         module: path.clone(),
                                         items: vec![],
                                         import_type: self.classify_import(&path),
+                                        ..Default::default()
                                     });
                                 }
                             }

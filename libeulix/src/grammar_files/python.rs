@@ -18,9 +18,6 @@ struct SecurityPattern {
 }
 
 // Regex Patterns compiled once at first use
-static FROM_IMPORT_RE: LazyLock<Regex> =
-    LazyLock::new(|| static_regex(r"from\s+(\S+)\s+import\s+(.+)"));
-
 static ATTRIBUTE_RE: LazyLock<Regex> =
     LazyLock::new(|| static_regex(r"(\w+)\s*:\s*([^=]+)(?:=\s*(.+))?"));
 
@@ -133,27 +130,33 @@ impl PythonParser {
         self.source_code.lines().count()
     }
 
+    /// Every `import` / `from ... import` in the file, including the ones
+    /// nested in functions, `if TYPE_CHECKING:` and `try:` blocks: a lazy
+    /// import inside a function still names what that function calls.
     fn extract_imports(&self, root: &Node) -> Vec<Import> {
         let mut imports = Vec::new();
-        let mut cursor = root.walk();
+        self.collect_imports(root, &mut imports);
+        imports
+    }
 
-        for child in root.children(&mut cursor) {
+    fn collect_imports(&self, node: &Node, imports: &mut Vec<Import>) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
             match child.kind() {
+                // `import a.b`, `import a.b as c, d` — one Import per module.
                 "import_statement" => {
-                    let module = self.get_node_text(&child);
-                    let cleaned = module
-                        .replace("import ", "")
-                        .split(',')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-
-                    if !cleaned.is_empty() {
+                    let mut nc = child.walk();
+                    for name in child.children_by_field_name("name", &mut nc) {
+                        let (module, alias) = self.split_aliased(&name);
+                        if module.is_empty() {
+                            continue;
+                        }
                         imports.push(Import {
-                            module: cleaned.clone(),
+                            import_type: self.classify_import(&module),
+                            module,
                             items: vec![],
-                            import_type: self.classify_import(&cleaned),
+                            alias,
+                            ..Default::default()
                         });
                     }
                 }
@@ -162,11 +165,25 @@ impl PythonParser {
                         imports.push(import);
                     }
                 }
-                _ => {}
+                _ => self.collect_imports(&child, imports),
             }
         }
+    }
 
-        imports
+    /// `a.b` -> ("a.b", None);  `a.b as c` -> ("a.b", Some("c"))
+    fn split_aliased(&self, node: &Node) -> (String, Option<String>) {
+        if node.kind() == "aliased_import" {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| self.get_node_text(&n))
+                .unwrap_or_default();
+            let alias = node
+                .child_by_field_name("alias")
+                .map(|n| self.get_node_text(&n));
+            (name, alias)
+        } else {
+            (self.get_node_text(node), None)
+        }
     }
 
     fn classify_import(&self, module: &str) -> String {
@@ -200,27 +217,51 @@ impl PythonParser {
         }
     }
 
+    /// `from m import a, b as c` / `from m import (a, b)` / `from .m import a`
+    /// / `from . import a` / `from m import *`.
+    ///
+    /// The module keeps its leading dots (`..pkg.mod`), so the resolver can
+    /// tell a relative import from an absolute one. Items are the *local*
+    /// names; renames are listed in `renamed`.
     fn parse_import_from(&self, node: &Node) -> Option<Import> {
-        let text = self.get_node_text(node);
-
-        if let Some(caps) = FROM_IMPORT_RE.captures(&text) {
-            let module = caps.get(1)?.as_str().to_string();
-            let items_str = caps.get(2)?.as_str();
-            let items: Vec<String> = items_str
-                .split(',')
-                .map(|s| s.split_whitespace().next().unwrap_or(s.trim()))
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            return Some(Import {
-                module: module.clone(),
-                items,
-                import_type: self.classify_import(&module),
-            });
+        let module = node
+            .child_by_field_name("module_name")
+            .map(|n| self.get_node_text(&n))?
+            .split_whitespace()
+            .collect::<String>();
+        if module.is_empty() {
+            return None;
         }
-
-        None
+        let mut items = Vec::new();
+        let mut renamed = Vec::new();
+        let mut nc = node.walk();
+        for name in node.children_by_field_name("name", &mut nc) {
+            let (exported, alias) = self.split_aliased(&name);
+            if exported.is_empty() {
+                continue;
+            }
+            match alias {
+                Some(local) => {
+                    items.push(local.clone());
+                    renamed.push((local, exported));
+                }
+                None => items.push(exported),
+            }
+        }
+        let mut wc = node.walk();
+        if node
+            .children(&mut wc)
+            .any(|c| c.kind() == "wildcard_import")
+        {
+            items.push("*".to_string());
+        }
+        Some(Import {
+            import_type: self.classify_import(&module),
+            module,
+            items,
+            renamed,
+            ..Default::default()
+        })
     }
 
     fn extract_functions(&self, root: &Node) -> Vec<Function> {

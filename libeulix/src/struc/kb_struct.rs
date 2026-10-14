@@ -74,12 +74,22 @@ pub struct FileData {
     pub syntax: SyntaxHealth,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Import {
     pub module: String,
+    /// Local names the import binds, as they appear at call sites
+    /// (`from m import f as g` -> `g`).
     pub items: Vec<String>,
     #[serde(rename = "type")]
     pub import_type: String, // "external" | "internal"
+    /// `(local, exported)` for every renamed item: `from m import f as g`,
+    /// `import { f as g } from "m"` -> `("g", "f")`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed: Vec<(String, String)>,
+    /// Local name bound to the module itself: `import a.b as c` -> `c`,
+    /// `import * as ns from "m"` -> `ns`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]

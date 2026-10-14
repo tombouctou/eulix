@@ -380,6 +380,7 @@ impl JavaParser {
                 module,
                 items,
                 import_type,
+                ..Default::default()
             });
         }
         imports
