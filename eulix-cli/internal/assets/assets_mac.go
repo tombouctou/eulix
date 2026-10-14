@@ -21,6 +21,15 @@ const (
 	parserBinDestName = "eulix_parser"
 )
 
+// onnxruntime-rocm (onnx-amd.txt, the cross-platform default) ships no
+// macOS wheels, so a darwin build that was not given a requirements file
+// via -ldflags uses plain onnxruntime (CPU + CoreML execution providers).
+func init() {
+	if embed_requirements == "onnx-amd.txt" {
+		embed_requirements = "onnx-mac.txt"
+	}
+}
+
 func parserBinaryBytes() ([]byte, string, error) {
 	content, err := parserBin.ReadFile(parserBinFile)
 	if err != nil {

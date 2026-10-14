@@ -261,7 +261,7 @@ Then make sure `~/.local/bin` is on your PATH (add to `~/.zshrc`):
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-> **Requirements file on macOS:** the build script only defines two ONNX variants, `onnx-amd.txt` and `onnx-nvidia.txt`. There is no macOS-specific file. `onnx-nvidia.txt` expects CUDA, which Macs don't have, so `onnx-amd.txt` is the sensible default. Swap it if the repo adds a dedicated mac variant.
+> **Requirements file on macOS:** use `onnx-mac.txt` (plain `onnxruntime`, which carries the CPU and CoreML execution providers). `onnx-amd.txt` pulls `onnxruntime-rocm`, which has no macOS wheels, and `onnx-nvidia.txt` expects CUDA. A darwin build that is not given `embed_requirements` picks `onnx-mac.txt` on its own.
 
 ### Option B: Cross-compile from Linux with zig
 
@@ -284,7 +284,7 @@ HASH_MACOS_ARM=$(sha256sum eulix-cli/internal/assets/bins/eulix_parser_macos_arm
 # (zip the embedder as in the manual Linux steps), then:
 cd eulix-cli
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build \
-  -ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=onnx-amd.txt' -X 'eulix/internal/assets.ParserHash=${HASH_MACOS_ARM}'" \
+  -ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=onnx-mac.txt' -X 'eulix/internal/assets.ParserHash=${HASH_MACOS_ARM}'" \
   -trimpath -o eulix_macos_arm_amd ./cmd/eulix/main.go
 ```
 
@@ -468,7 +468,8 @@ eulix --help
 | File              | Use for                                                                       |
 | ----------------- | ----------------------------------------------------------------------------- |
 | `onnx-nvidia.txt` | NVIDIA GPUs (CUDA)                                                            |
-| `onnx-amd.txt`    | AMD GPUs, and the default for machines without an NVIDIA GPU (including Macs) |
+| `onnx-amd.txt`    | AMD GPUs, and the default for Linux/Windows machines without an NVIDIA GPU    |
+| `onnx-mac.txt`    | macOS (Apple Silicon): CPU + CoreML execution providers                       |
 
 The choice is baked into the binary at build time through `-X eulix/internal/assets.embed_requirements=<file>`. To switch backends, rebuild the CLI with the other file. PyTorch is no longer installed by hand, so the old per-platform `torch` install table has been removed.
 

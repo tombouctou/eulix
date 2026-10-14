@@ -26,25 +26,35 @@ DOC_URL="https://github.com/${REPO}/blob/main/docs/install.md"
 
 IS_UV=false
 DETECTED_OS=""
-GPU_VARIANT=""   # amd | nvidia
+DETECTED_ARCH=""
+GPU_VARIANT=""   # amd | nvidia | mac
 ASSET_NAME=""
 
-# Detect OS (linux/mac only — mac unsupported for now)
+# Detect OS and CPU architecture (linux/amd64, darwin/arm64)
 Check_OS() {
     info "Detecting operating system..."
-    local os
+    local os arch
     os="$(uname -s)"
+    arch="$(uname -m)"
     case "$os" in
         Linux*)
             DETECTED_OS="linux"
+            DETECTED_ARCH="amd64"
             success "Detected Linux."
             ;;
         Darwin*)
-            echo -e "${RED}macOS detected.${RESET}"
-            echo "Eulix currently doesn't ship a macOS binary."
-            echo "Please build it manually — see the docs:"
-            echo "  ${DOC_URL}"
-            exit 1
+            if [[ "$arch" != "arm64" ]]; then
+                echo -e "${RED}Intel macOS detected.${RESET}"
+                echo "Release binaries are built for Apple Silicon (arm64) only."
+                echo "Please build it manually — see the docs:"
+                echo "  ${DOC_URL}"
+                exit 1
+            fi
+            DETECTED_OS="darwin"
+            DETECTED_ARCH="arm64"
+            # The only macOS variant: plain onnxruntime (CPU + CoreML).
+            GPU_VARIANT="mac"
+            success "Detected macOS (Apple Silicon)."
             ;;
         CYGWIN*|MINGW*|MSYS*|Windows*)
             echo -e "${RED}Windows detected.${RESET}"
@@ -60,6 +70,9 @@ Check_OS() {
 
 # Ask user which GPU/backend variant to download
 choose_gpu_variant() {
+    if [[ -n "$GPU_VARIANT" ]]; then
+        return # fixed by the platform (macOS)
+    fi
     info "Select the ONNX backend variant to install:"
     echo "  1) amd     — CPU / AMD (onnx-amd)"
     echo "  2) nvidia  — NVIDIA GPU (onnx-nvidia)"
@@ -128,6 +141,15 @@ setup_venv() {
     success "Virtual environment created at $EULIX_VENV."
 }
 
+# sha256 of a file; macOS has shasum but no sha256sum
+sha256_of() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
 # Helper function to get expected SHA256 checksum regardless of directory prefixes in checksums.txt
 get_checksum() {
     local target_filename="$1"
@@ -141,7 +163,7 @@ get_checksum() {
 
 # Download the release binary for the chosen OS/GPU variant and vizeulize.html, verify checksums, install them
 download_binary() {
-    ASSET_NAME="eulix-linux-amd64-onnx-${GPU_VARIANT}"
+    ASSET_NAME="eulix-${DETECTED_OS}-${DETECTED_ARCH}-onnx-${GPU_VARIANT}"
     local html_asset_name="vizeulize.html"
 
     local asset_url="${RELEASE_BASE}/${ASSET_NAME}"
@@ -172,7 +194,7 @@ download_binary() {
     if [[ -z "$expected_bin" ]]; then
         warn "Could not find ${ASSET_NAME} in checksums.txt — skipping binary verification."
     else
-        actual_bin="$(sha256sum "$tmp_bin" | awk '{print $1}')"
+        actual_bin="$(sha256_of "$tmp_bin")"
         if [[ "$expected_bin" != "$actual_bin" ]]; then
             rm -f "$tmp_bin" "$tmp_html" "$tmp_checksums"
             die "Checksum mismatch for ${ASSET_NAME}! Expected ${expected_bin}, got ${actual_bin}."
@@ -186,7 +208,7 @@ download_binary() {
     if [[ -z "$expected_html" ]]; then
         warn "Could not find ${html_asset_name} in checksums.txt — skipping HTML verification."
     else
-        actual_html="$(sha256sum "$tmp_html" | awk '{print $1}')"
+        actual_html="$(sha256_of "$tmp_html")"
         if [[ "$expected_html" != "$actual_html" ]]; then
             rm -f "$tmp_bin" "$tmp_html" "$tmp_checksums"
             die "Checksum mismatch for ${html_asset_name}! Expected ${expected_html}, got ${actual_html}."

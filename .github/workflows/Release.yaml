@@ -93,7 +93,7 @@ jobs:
             parser_src: eulix_parser
             parser_embed: eulix_parser_darwin
             ext: ''
-            variants: 'amd' # NVIDIA/CUDA doesn't exist on Apple Silicon
+            variants: 'mac' # onnx-mac.txt: plain onnxruntime (CPU + CoreML); no ROCm/CUDA wheels on macOS
 
     defaults:
       run:
