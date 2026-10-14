@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::react::{jsx_component_name, unwrap_component_wrapper};
-use super::utils::{extract_todos, static_regex};
+use super::utils::{extract_todos, qualified_callee, static_regex};
 
 use crate::struc::kb_struct::*;
 use crate::utils::syntax;
@@ -791,14 +791,9 @@ impl TypeScriptParser {
 
         if node.kind() == "call_expression" {
             if let Some(func_node) = node.child_by_field_name("function") {
-                let call_text = self.get_node_text(&func_node);
-                let name = call_text
-                    .trim_start_matches("await ")
-                    .split('.')
-                    .next_back()
-                    .unwrap_or(&call_text)
-                    .trim()
-                    .to_string();
+                // `items.find()` stays `items.find`, not a bare `find`: the
+                // resolver treats a receiver as a method call, not a function.
+                let name = qualified_callee(&func_node, self.source_code.as_bytes());
 
                 if !name.is_empty() {
                     let key = format!("{}:{}", name, node.start_position().row);
@@ -1427,6 +1422,26 @@ import type { T } from "./types";
             .flat_map(|i| i.items.iter().map(|s| s.as_str()))
             .collect();
         assert_eq!(items, vec!["Default", "A", "C", "ns", "T"]);
+    }
+
+    // A call keeps a simple receiver: `items.find()` is not a bare `find()`.
+    #[test]
+    fn call_keeps_its_receiver() {
+        let fd = parse_tsx(
+            r#"
+export function f(items: string[]) {
+    items.find(Boolean);
+    api.cases.list();
+    this.save();
+    load().then(done);
+    plain();
+}
+"#,
+        );
+        assert_eq!(
+            callees(find_fn(&fd, "f")),
+            vec!["items.find", "api.cases.list", "this.save", "().then", "load", "plain"]
+        );
     }
 
     // Plain .ts keeps the TypeScript grammar: `<T>x` casts must parse.

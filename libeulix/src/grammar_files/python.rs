@@ -1,7 +1,7 @@
 // Copyright 2025-2026 Dawood K. (Nurysso)
 // SPDX-License-Identifier: Apache-2.0
 
-use super::utils::{extract_todos, static_regex};
+use super::utils::{extract_todos, qualified_callee, static_regex};
 
 use crate::struc::kb_struct::*;
 use crate::utils::syntax;
@@ -508,13 +508,10 @@ impl PythonParser {
 
         if node.kind() == "call" {
             if let Some(func_node) = node.child_by_field_name("function") {
-                if let Ok(call_name) = func_node.utf8_text(self.source_code.as_bytes()) {
-                    let name = call_name
-                        .split('.')
-                        .next_back()
-                        .unwrap_or(call_name)
-                        .trim()
-                        .to_string();
+                {
+                    // Keep the receiver (`m.f`, `self.f`): the call-graph
+                    // resolver needs it to follow `import m` and the class.
+                    let name = qualified_callee(&func_node, self.source_code.as_bytes());
 
                     if !name.is_empty() {
                         let key = format!("{}:{}", name, node.start_position().row);
