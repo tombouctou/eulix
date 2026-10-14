@@ -30,6 +30,14 @@ type Retriever interface {
 	MultiHop(ctx context.Context, q string, seeds, expansion []string, cot bool) (string, error)
 }
 
+// RouteRetriever is implemented by a Retriever that can answer a route
+// lookup (`POST /rest/api/2/issue/{id}/transitions`, `transitions endpoint`)
+// from the project's endpoints. direct is false when q is not such a lookup
+// or nothing matches.
+type RouteRetriever interface {
+	Route(q string) (text string, direct bool)
+}
+
 // ========== Router-backed Retriever ==========
 
 // routerRetriever adapts *query.Router to the Retriever interface. The
@@ -44,6 +52,11 @@ type routerRetriever struct{ router *query.Router }
 // OpenEnded forwards to the router.
 func (r routerRetriever) OpenEnded(_ context.Context, q string, cot bool) (string, error) {
 	return r.router.PromptOrAnswerWithCoT(q, cot)
+}
+
+// Route looks q up in the router's endpoints.
+func (r routerRetriever) Route(q string) (string, bool) {
+	return r.router.RouteLookup(q)
 }
 
 // Anchored rewrites the query to include the given anchors.

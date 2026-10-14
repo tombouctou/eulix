@@ -44,6 +44,9 @@ type Router struct {
 	cgBuild         *retrieval.CallGraphIdx
 	currentChecksum string
 	debug           *utils.DebugLogger
+	// api_endpoint entry points with a path, compiled on first use.
+	routesOnce sync.Once
+	routes     []routeEntry
 }
 
 type callGraphIndex struct {
@@ -106,6 +109,13 @@ func (r *Router) PromptOrAnswer(query string) (string, error) {
 }
 
 func (r *Router) PromptOrAnswerWithCoT(query string, includeCoT bool) (string, error) {
+	// A route (`POST /rest/api/2/issue/{id}/transitions`) is looked up in
+	// the endpoints before the query is classified.
+	routeText, direct := r.routeLookup(query)
+	if direct {
+		r.debug.Log("[ROUTE] PromptOrAnswer: route lookup %q", query)
+		return routeText, nil
+	}
 	classification := r.classifier.Classify(query)
 	r.debug.Log("[ROUTE] PromptOrAnswer: query=%q type=%v includeCoT=%v", query, classification.Type, includeCoT)
 
@@ -149,6 +159,9 @@ func (r *Router) PromptOrAnswerWithCoT(query string, includeCoT bool) (string, e
 	}
 
 	contextPrompt := r.llmClient.BuildFullPrompt(ctx, query)
+	if routeText != "" {
+		contextPrompt = routeText + "\n" + contextPrompt
+	}
 	if !includeCoT {
 		return contextPrompt, nil
 	}
@@ -165,6 +178,10 @@ func (r *Router) PromptOrAnswerWithCoT(query string, includeCoT bool) (string, e
 }
 
 func (r *Router) QueryEngine(query string) (string, error) {
+	if text, direct := r.routeLookup(query); direct {
+		r.debug.Log("[ROUTE] QueryEngine: route lookup %q", query)
+		return text, nil
+	}
 	classification := r.classifier.Classify(query)
 	r.debug.Log("[ROUTE] QueryEngine: query=%q type=%v", query, classification.Type)
 

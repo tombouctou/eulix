@@ -15,6 +15,8 @@ import (
 // on to, so they rely on semantic and subsystem signals. The strategy picks
 // the most precise approach the calling agent allows and degrades gracefully:
 //
+//	0. route          the query names an HTTP route: the endpoints whose
+//	                  template matches it, and nothing else runs
 //	1. multi-hop      the agent already knows the project: it named anchors in
 //	                  the query and/or supplied 'known_symbols' from its own
 //	                  session context
@@ -100,6 +102,18 @@ func (s *Server) retrieveLocked(ctx context.Context, q string, known []string, c
 			text = lexicalPreface + text
 		}
 		return text, trace, nil
+	}
+
+	// route. A route lookup is answered by the endpoint templates or not
+	// at all: a match is exact, and the stages below only rephrase the
+	// path into words the source does not contain.
+	if rr, ok := retr.(RouteRetriever); ok {
+		if text, direct := rr.Route(q); direct && text != "" {
+			trace.Attempts = append(trace.Attempts, StageAttempt{Stage: StageRoute, Score: 1})
+			trace.Chosen = StageRoute
+			mem.Observe(text)
+			return text, trace, nil
+		}
 	}
 
 	// multi-hop. Only attempted when the agent has shown it knows

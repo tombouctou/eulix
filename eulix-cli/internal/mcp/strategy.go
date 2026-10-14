@@ -28,6 +28,12 @@ import (
 type Stage string
 
 const (
+	// StageRoute answers a query naming an HTTP route from the project's
+	// endpoints (route templates), before any retrieval. It runs only when
+	// the query is the route lookup and something matches, and is not
+	// scored: the template match is exact.
+	StageRoute Stage = "route"
+
 	// StageMultiHop is the most informed path: the calling agent already
 	// knows the project (anchors appear in the query and/or 'known_symbols'
 	// was supplied from the agent's own session), so the router can follow

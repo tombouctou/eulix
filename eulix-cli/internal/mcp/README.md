@@ -115,6 +115,13 @@ attempt, stopping at the first one that clears a quality bar.
 4. lexical        grep-style filesystem search
 ```
 
+Before the cascade, a query that names an HTTP route
+(`POST /rest/api/2/issue/{idOrKey}/transitions`, a full URL, `transitions
+endpoint`) is matched against the route templates of the `api_endpoint`
+entry points; if one matches, that answer (the endpoints, and the handler's
+call graph when one stands out) is returned unscored and the cascade does
+not run.
+
 ### What is an "anchor"
 
 An anchor is a piece of text that names something concrete: a file path, a
