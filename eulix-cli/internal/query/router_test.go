@@ -1156,6 +1156,8 @@ func TestHandleCallGraph(t *testing.T) {
 				resolvedEdge("method_Blobs_WriteAsync::Blobs.cs", iPut, "package", 3),
 				resolvedEdge("method_Seeder_Seed::Seeder.cs", iPut, "name", 8),
 				resolvedEdge("method_S3Tests_Puts::S3Tests.cs", s3Put, "import", 5),
+				// Listed once, as a direct caller, though it calls both.
+				resolvedEdge("method_S3Tests_Puts::S3Tests.cs", iPut, "import", 6),
 				M{"From": iPut, "To": s3Put, "EdgeType": "dispatch", "CallSiteLine": 4},
 				M{"From": iPut, "To": filePut, "EdgeType": "dispatch", "CallSiteLine": 9},
 			},
@@ -1180,7 +1182,7 @@ func TestHandleCallGraph(t *testing.T) {
 		}
 		// No direct caller: the interface callers are the answer.
 		got, _ = r.handleCallGraph("", cls(classifier.QueryTypeCallGraph, "FileStore.PutAsync"))
-		if !strings.Contains(got, "(none by name — see the calls through the interface below)") ||
+		if !strings.Contains(got, "(none call it directly — see the calls through the interface below)") ||
 			!strings.Contains(got, "⇠ Blobs.WriteAsync") {
 			t.Errorf("got:\n%s", got)
 		}

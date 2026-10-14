@@ -427,9 +427,19 @@ func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
 	guessedCallers := r.cgBuild.CalledByName[key]
 	guessedCallees := r.cgBuild.CallsByName[key]
 	bases := r.dispatchBases(key)
+	// A caller already listed for `key` itself is not repeated under the
+	// interface it also calls.
+	shown := make(map[string]bool, len(callers)+len(guessedCallers))
+	for _, c := range append(append([]string(nil), callers...), guessedCallers...) {
+		shown[c] = true
+	}
 	through := 0
 	for _, base := range bases {
-		through += len(r.cgBuild.CalledBy[base]) + len(r.cgBuild.CalledByName[base])
+		for _, c := range append(append([]string(nil), r.cgBuild.CalledBy[base]...), r.cgBuild.CalledByName[base]...) {
+			if !shown[c] {
+				through++
+			}
+		}
 	}
 
 	var b strings.Builder
@@ -453,7 +463,7 @@ func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
 	b.WriteString("\n┌── Called by (Inbound):\n")
 	if len(callers) == 0 {
 		if through > 0 && len(guessedCallers) == 0 {
-			b.WriteString("│   (none by name — see the calls through the interface below)\n")
+			b.WriteString("│   (none call it directly — see the calls through the interface below)\n")
 		} else if len(guessedCallers) == 0 {
 			b.WriteString("│   (none — likely an entry point or exported API)\n")
 		} else {
@@ -474,7 +484,7 @@ func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
 				r.candidateNote(callerID, key))
 		}
 	}
-	r.writeDispatch(&b, key, bases)
+	r.writeDispatch(&b, key, bases, shown)
 
 	b.WriteString("└── Calls (Outbound):\n")
 	if len(callees) == 0 {
@@ -531,17 +541,26 @@ func (r *Router) dispatchBases(key string) []string {
 // through an interface or a base type — they name the interface method,
 // and the call may as well run another implementation — and, for an
 // interface / base method, the implementations a call to it may run.
-func (r *Router) writeDispatch(b *strings.Builder, key string, bases []string) {
+func (r *Router) writeDispatch(b *strings.Builder, key string, bases []string, shown map[string]bool) {
+	notShown := func(xs []string) []string {
+		var out []string
+		for _, x := range xs {
+			if !shown[x] {
+				out = append(out, x)
+			}
+		}
+		return out
+	}
 	for _, base := range bases {
-		callers := r.cgBuild.CalledBy[base]
-		guessed := r.cgBuild.CalledByName[base]
+		callers := notShown(r.cgBuild.CalledBy[base])
+		guessed := notShown(r.cgBuild.CalledByName[base])
 		fmt.Fprintf(b, "├── Called through %s  (%s)", bareID(base), r.fileOf(base))
 		if others := len(r.cgBuild.ImplementedBy[base]) - 1; others > 0 {
 			fmt.Fprintf(b, ", which may run %d other implementation(s) too", others)
 		}
 		b.WriteString(":\n")
 		if len(callers)+len(guessed) == 0 {
-			b.WriteString("│   (no callers)\n")
+			b.WriteString("│   (no other callers)\n")
 		}
 		for _, c := range callers {
 			fmt.Fprintf(b, "│   ⇠ %s  (%s)\n", bareID(c), r.fileOf(c))
