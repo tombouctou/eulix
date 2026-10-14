@@ -1216,7 +1216,7 @@ func formatFileImports(file string, idx *depIndex) string {
 
 var sourceFileExts = []string{
 	".go", ".py", ".rs", ".ts", ".tsx", ".js", ".jsx",
-	".java", ".c", ".h", ".cpp", ".hpp", ".rb", ".php",
+	".java", ".c", ".h", ".cpp", ".hpp", ".rb", ".php", ".cs",
 }
 
 func looksLikeFilePath(s string) bool {

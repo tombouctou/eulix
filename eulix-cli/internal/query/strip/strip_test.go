@@ -48,6 +48,7 @@ func TestStripCommentsAndDocs_AllDispatchedLanguages(t *testing.T) {
 		{"c", "code(); // trailing comment"},
 		{"cpp", "code(); // trailing comment"},
 		{"java", "code(); // trailing comment"},
+		{"csharp", "code(); // trailing comment"},
 		{"python", "code()  # trailing comment"},
 	}
 

@@ -28,7 +28,7 @@ func StripCommentsAndDocs(lines []string, lang string) []string {
 		cleaned = stripGoComments(src)
 	case "javascript", "typescript":
 		cleaned = stripCStyleComments(src, true) // backtick template literals
-	case "rust", "c", "cpp", "java":
+	case "rust", "c", "cpp", "java", "csharp":
 		cleaned = stripCStyleComments(src, false)
 	case "python":
 		cleaned = stripPythonComments(src)

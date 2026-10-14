@@ -644,6 +644,8 @@ func detectLanguage(filePath string) string {
 		return "cpp"
 	case ".java":
 		return "java"
+	case ".cs":
+		return "csharp"
 	default:
 		return "unknown"
 	}
