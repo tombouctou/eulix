@@ -1,6 +1,7 @@
 // Copyright 2025-2026 Dawood K. (Nurysso)
 // SPDX-License-Identifier: Apache-2.0
 
+use super::react::{jsx_component_name, unwrap_component_wrapper};
 use super::utils::{extract_todos, static_regex};
 
 use crate::struc::kb_struct::*;
@@ -84,6 +85,10 @@ static SECURITY_PATTERNS: LazyLock<Vec<SecurityPattern>> = LazyLock::new(|| {
 pub struct TypeScriptParser {
     source_code: String,
     file_path: String,
+    /// `.tsx`: parse with the TSX grammar. The plain TypeScript grammar
+    /// cannot parse JSX, and the TSX one cannot parse `<T>expr` casts, so
+    /// the choice follows the file extension.
+    tsx: bool,
 }
 
 impl TypeScriptParser {
@@ -91,13 +96,27 @@ impl TypeScriptParser {
         Self {
             source_code,
             file_path,
+            tsx: false,
+        }
+    }
+
+    pub fn new_tsx(source_code: String, file_path: String) -> Self {
+        Self {
+            source_code,
+            file_path,
+            tsx: true,
         }
     }
 
     pub fn parse(&self) -> Result<FileData, String> {
         let mut parser = Parser::new();
+        let grammar = if self.tsx {
+            tree_sitter_typescript::LANGUAGE_TSX
+        } else {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT
+        };
         parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .set_language(&grammar.into())
             .map_err(|e| format!("Failed to load TypeScript grammar: {}", e))?;
 
         let tree = parser
@@ -175,27 +194,7 @@ impl TypeScriptParser {
         }
 
         let mut items: Vec<String> = Vec::new();
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            match child.kind() {
-                "import_clause" => {
-                    let clause_text = self.get_node_text(&child);
-                    items.push(clause_text);
-                }
-                "namespace_import" => {
-                    items.push(self.get_node_text(&child));
-                }
-                "named_imports" => {
-                    let mut nc = child.walk();
-                    for item in child.children(&mut nc) {
-                        if item.kind() == "import_specifier" {
-                            items.push(self.get_node_text(&item));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        self.collect_import_names(node, &mut items);
 
         let import_type = self.classify_import(&module);
         imports.push(Import {
@@ -203,6 +202,43 @@ impl TypeScriptParser {
             items,
             import_type,
         });
+    }
+
+    /// Local names an import binds: `Default`, `{ A, B as C }` -> `A`, `C`,
+    /// `* as ns` -> `ns`. These are the names the call-graph resolver sees
+    /// at call sites, so they must not be the raw clause text.
+    fn collect_import_names(&self, node: &Node, items: &mut Vec<String>) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "import_clause" => self.collect_import_names(&child, items),
+                "identifier" => items.push(self.get_node_text(&child)),
+                "namespace_import" => {
+                    let mut nc = child.walk();
+                    let id = child
+                        .named_children(&mut nc)
+                        .find(|c| c.kind() == "identifier");
+                    if let Some(id) = id {
+                        items.push(self.get_node_text(&id));
+                    }
+                }
+                "named_imports" => {
+                    let mut nc = child.walk();
+                    for spec in child.named_children(&mut nc) {
+                        if spec.kind() != "import_specifier" {
+                            continue;
+                        }
+                        let local = spec
+                            .child_by_field_name("alias")
+                            .or_else(|| spec.child_by_field_name("name"));
+                        if let Some(n) = local {
+                            items.push(self.get_node_text(&n));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn classify_import(&self, module: &str) -> String {
@@ -232,13 +268,27 @@ impl TypeScriptParser {
                 "export_statement" | "ambient_declaration" => {
                     let mut ec = child.walk();
                     for inner in child.children(&mut ec) {
-                        if matches!(
-                            inner.kind(),
-                            "function_declaration" | "function" | "generator_function_declaration"
-                        ) {
-                            if let Some(func) = self.parse_function(&inner, "") {
-                                functions.push(func);
+                        match inner.kind() {
+                            "function_declaration"
+                            | "function"
+                            | "function_expression"
+                            | "generator_function_declaration" => {
+                                if let Some(func) = self.parse_function(&inner, "") {
+                                    functions.push(func);
+                                }
                             }
+                            // `export const X = () => ...` / `export const X = memo(...)`
+                            "lexical_declaration" | "variable_declaration" => {
+                                let mut vc = inner.walk();
+                                for decl in inner.children(&mut vc) {
+                                    if decl.kind() == "variable_declarator" {
+                                        if let Some(func) = self.parse_variable_function(&decl) {
+                                            functions.push(func);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -263,11 +313,10 @@ impl TypeScriptParser {
             .map(|n| self.get_node_text(&n))?;
 
         let value = node.child_by_field_name("value")?;
+        // `const X = memo(() => ...)` / `forwardRef((props, ref) => ...)`
+        let value = unwrap_component_wrapper(value, self.source_code.as_bytes());
 
-        if !matches!(
-            value.kind(),
-            "arrow_function" | "function" | "generator_function"
-        ) {
+        if !is_function_value(&value) {
             return None;
         }
 
@@ -630,7 +679,16 @@ impl TypeScriptParser {
         let mut vars = Vec::new();
         let mut cursor = root.walk();
 
-        for child in root.children(&mut cursor) {
+        for top in root.children(&mut cursor) {
+            // `export const X = ...` is a global just like `const X = ...`.
+            let child = if top.kind() == "export_statement" {
+                match top.child_by_field_name("declaration") {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else {
+                top
+            };
             match child.kind() {
                 "lexical_declaration" | "variable_declaration" => {
                     let mut vc = child.walk();
@@ -647,10 +705,10 @@ impl TypeScriptParser {
 
                             let value = decl.child_by_field_name("value");
                             if let Some(v) = &value {
-                                if matches!(
-                                    v.kind(),
-                                    "arrow_function" | "function" | "generator_function"
-                                ) {
+                                // Captured as a Function by parse_variable_function.
+                                let inner =
+                                    unwrap_component_wrapper(*v, self.source_code.as_bytes());
+                                if is_function_value(&inner) {
                                     continue;
                                 }
                             }
@@ -701,6 +759,22 @@ impl TypeScriptParser {
             _ => context,
         };
 
+        // `<Child />` renders Child: record it as a call so component trees
+        // show up in the call graph.
+        if let Some(name) = jsx_component_name(node, self.source_code.as_bytes()) {
+            let key = format!("{}:{}", name, node.start_position().row);
+            if seen.insert(key) {
+                calls.push(FunctionCall {
+                    callee: name,
+                    defined_in: None,
+                    line: node.start_position().row + 1,
+                    args: self.extract_jsx_attribute_names(node),
+                    is_conditional: context != "unconditional",
+                    context: context.to_string(),
+                });
+            }
+        }
+
         if node.kind() == "call_expression" {
             if let Some(func_node) = node.child_by_field_name("function") {
                 let call_text = self.get_node_text(&func_node);
@@ -733,6 +807,25 @@ impl TypeScriptParser {
         for child in node.children(&mut cursor) {
             self.find_calls_recursive(&child, calls, seen, child_context);
         }
+    }
+
+    /// Prop names of a JSX element (`<A x={1} {...rest} />` -> `x`, `{...rest}`).
+    fn extract_jsx_attribute_names(&self, node: &Node) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut cursor = node.walk();
+        for attr in node.children_by_field_name("attribute", &mut cursor) {
+            let name = match attr.kind() {
+                "jsx_attribute" => attr
+                    .named_child(0)
+                    .map(|n| self.get_node_text(&n))
+                    .unwrap_or_default(),
+                _ => self.get_node_text(&attr),
+            };
+            if !name.is_empty() {
+                args.push(name);
+            }
+        }
+        args
     }
 
     fn extract_call_arguments(&self, call_node: &Node) -> Vec<String> {
@@ -976,6 +1069,12 @@ impl TypeScriptParser {
     fn find_call_names(&self, node: &Node, calls: &mut Vec<String>, seen: &mut HashSet<String>) {
         let mut cursor = node.walk();
 
+        if let Some(name) = jsx_component_name(node, self.source_code.as_bytes()) {
+            if seen.insert(name.clone()) {
+                calls.push(name);
+            }
+        }
+
         if node.kind() == "call_expression" {
             if let Some(func_node) = node.child_by_field_name("function") {
                 let name = self.get_node_text(&func_node);
@@ -1131,6 +1230,14 @@ impl TypeScriptParser {
     }
 }
 
+/// Function-valued initializers that become Function entries.
+fn is_function_value(node: &Node) -> bool {
+    matches!(
+        node.kind(),
+        "arrow_function" | "function" | "function_expression" | "generator_function"
+    )
+}
+
 pub fn parse_source(path: &Path, source_code: &str) -> Result<(String, FileData), String> {
     // Strips leading "./" or ".\" if present, otherwise leaves path as is
     let clean_path = path.strip_prefix("./").unwrap_or(path);
@@ -1142,8 +1249,181 @@ pub fn parse_source(path: &Path, source_code: &str) -> Result<(String, FileData)
     Ok((path_str, file_data))
 }
 
+/// `.tsx`: same extraction as TypeScript, TSX grammar, language label
+/// "typescript" (the CLI groups .ts and .tsx together).
+pub fn parse_tsx_source(path: &Path, source_code: &str) -> Result<(String, FileData), String> {
+    let clean_path = path.strip_prefix("./").unwrap_or(path);
+    let path_str = clean_path.to_string_lossy().to_string();
+
+    let parser = TypeScriptParser::new_tsx(source_code.to_string(), path_str.clone());
+    let file_data = parser.parse()?;
+
+    Ok((path_str, file_data))
+}
+
 pub fn parse_file(path: &Path) -> Result<(String, FileData), String> {
     let source_code = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
     parse_source(path, &source_code)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used)]
+
+    use super::*;
+
+    fn parse_tsx(src: &str) -> FileData {
+        let (_, fd) = crate::grammar_files::parse_source(Path::new("web/page.tsx"), src)
+            .expect("parse should succeed");
+        fd
+    }
+
+    fn fn_names(fd: &FileData) -> Vec<&str> {
+        fd.functions.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    fn find_fn<'a>(fd: &'a FileData, name: &str) -> &'a Function {
+        #[allow(clippy::panic)]
+        fd.functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function `{}` not found in {:?}", name, fn_names(fd)))
+    }
+
+    fn callees(f: &Function) -> Vec<&str> {
+        f.calls.iter().map(|c| c.callee.as_str()).collect()
+    }
+
+    // .tsx is routed to the TSX grammar and keeps the "typescript" label.
+    #[test]
+    fn tsx_file_parses_without_errors() {
+        let fd = parse_tsx(
+            r#"
+export default function Page() {
+    return <main className="p-4"><Card title="x" /></main>;
+}
+"#,
+        );
+        assert_eq!(fd.language, "typescript");
+        assert!(fd.syntax.is_clean(), "syntax: {:?}", fd.syntax);
+        find_fn(&fd, "Page");
+    }
+
+    // Capitalized JSX tags become calls; DOM tags (<div>) do not; the
+    // closing tag does not double the call.
+    #[test]
+    fn jsx_elements_become_calls() {
+        let fd = parse_tsx(
+            r#"
+import { Card } from "@/components/card";
+import * as Dialog from "@radix-ui/react-dialog";
+
+export function Page({ open }: { open: boolean }) {
+    return (
+        <div>
+            <Card title="a" {...rest}>
+                <span>text</span>
+            </Card>
+            {open && <Dialog.Content />}
+        </div>
+    );
+}
+"#,
+        );
+        let page = find_fn(&fd, "Page");
+        let names = callees(page);
+        assert_eq!(
+            names.iter().filter(|c| **c == "Card").count(),
+            1,
+            "calls: {:?}",
+            names
+        );
+        assert!(names.contains(&"Dialog.Content"), "calls: {:?}", names);
+        assert!(!names.contains(&"div") && !names.contains(&"span"));
+        let card = page
+            .calls
+            .iter()
+            .find(|c| c.callee == "Card")
+            .expect("Card");
+        assert_eq!(
+            card.args,
+            vec!["title".to_string(), "{...rest}".to_string()]
+        );
+    }
+
+    // `export const X = () => ...` and memo/forwardRef wrappers are
+    // components (Functions), not global variables.
+    #[test]
+    fn exported_and_wrapped_arrow_components_are_functions() {
+        let fd = parse_tsx(
+            r#"
+import { memo, forwardRef } from "react";
+import React from "react";
+
+export const Plain = () => <Inner />;
+export const Memoized = memo(function Memoized() { return <Inner />; });
+const Forwarded = forwardRef<HTMLDivElement, Props>((props, ref) => <div ref={ref}><Inner /></div>);
+export const Both = React.memo(React.forwardRef((p, r) => <Inner />));
+const Alias = memo(Plain);
+export const LIMIT = 10;
+
+function Inner() { return null; }
+"#,
+        );
+        assert!(fd.syntax.is_clean(), "syntax: {:?}", fd.syntax);
+        for name in ["Plain", "Memoized", "Forwarded", "Both"] {
+            let f = find_fn(&fd, name);
+            assert!(
+                callees(f).contains(&"Inner"),
+                "{} calls: {:?}",
+                name,
+                callees(f)
+            );
+        }
+        find_fn(&fd, "Inner");
+        // memo(Plain) wraps no function body: it stays a variable.
+        assert!(!fn_names(&fd).contains(&"Alias"));
+        let globals: Vec<&str> = fd.global_vars.iter().map(|g| g.name.as_str()).collect();
+        assert!(globals.contains(&"Alias"), "globals: {:?}", globals);
+        assert!(globals.contains(&"LIMIT"), "globals: {:?}", globals);
+        for name in ["Plain", "Memoized", "Forwarded", "Both"] {
+            assert!(
+                !globals.contains(&name),
+                "{} listed as global: {:?}",
+                name,
+                globals
+            );
+        }
+    }
+
+    // Import items are the local names a call site uses, not clause text.
+    #[test]
+    fn import_items_are_local_names() {
+        let fd = parse_tsx(
+            r#"
+import Default, { A, B as C } from "./mod";
+import * as ns from "./ns";
+import type { T } from "./types";
+"#,
+        );
+        let items: Vec<&str> = fd
+            .imports
+            .iter()
+            .flat_map(|i| i.items.iter().map(|s| s.as_str()))
+            .collect();
+        assert_eq!(items, vec!["Default", "A", "C", "ns", "T"]);
+    }
+
+    // Plain .ts keeps the TypeScript grammar: `<T>x` casts must parse.
+    #[test]
+    fn ts_file_keeps_typescript_grammar() {
+        let (_, fd) = crate::grammar_files::parse_source(
+            Path::new("lib/cast.ts"),
+            "export const n = <number>value;\nexport function f() { return g(); }\n",
+        )
+        .expect("parse should succeed");
+        assert!(fd.syntax.is_clean(), "syntax: {:?}", fd.syntax);
+        assert_eq!(callees(find_fn(&fd, "f")), vec!["g"]);
+    }
 }

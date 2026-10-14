@@ -75,7 +75,9 @@ pub fn collect_source_files_and_hash(
             Language::Cpp,
             Language::Python,
             Language::JavaScript,
+            Language::Jsx,
             Language::TypeScript,
+            Language::Tsx,
             Language::Go,
             Language::Rust,
             Language::Java,
@@ -84,20 +86,24 @@ pub fn collect_source_files_and_hash(
         languages
             .split(',')
             .map(|s| s.trim())
-            .filter_map(|lang_str| match lang_str.to_lowercase().as_str() {
-                "c" | "h" => Some(Language::C),
-                "cpp" | "c++" | "cxx" | "hpp" => Some(Language::Cpp),
-                "python" | "py" => Some(Language::Python),
-                "javascript" | "js" => Some(Language::JavaScript),
-                "java" => Some(Language::Java),
-                "typescript" | "ts" => Some(Language::TypeScript),
-                "go" | "golang" => Some(Language::Go),
-                "rust" | "rs" => Some(Language::Rust),
+            .flat_map(|lang_str| match lang_str.to_lowercase().as_str() {
+                "c" | "h" => vec![Language::C],
+                "cpp" | "c++" | "cxx" | "hpp" => vec![Language::Cpp],
+                "python" | "py" => vec![Language::Python],
+                // The base language includes its JSX dialect; `jsx` / `tsx`
+                // select the dialect alone.
+                "javascript" | "js" => vec![Language::JavaScript, Language::Jsx],
+                "jsx" => vec![Language::Jsx],
+                "java" => vec![Language::Java],
+                "typescript" | "ts" => vec![Language::TypeScript, Language::Tsx],
+                "tsx" => vec![Language::Tsx],
+                "go" | "golang" => vec![Language::Go],
+                "rust" | "rs" => vec![Language::Rust],
                 _ => {
                     if verbose {
                         eprintln!("     Unknown language filter '{}'", lang_str);
                     }
-                    None
+                    vec![]
                 }
             })
             .collect()
@@ -169,6 +175,11 @@ pub fn rel_path(file: &Path, root: &Path) -> String {
 }
 
 pub fn language_label(file: &Path) -> String {
-    // Debug format lowercased, e.g. "python", "rust", etc.
-    format!("{:?}", Language::detect(file)).to_lowercase()
+    // Debug format lowercased, e.g. "python", "rust", etc. JSX/TSX report
+    // under their base language, matching FileData.language.
+    match Language::detect(file) {
+        Language::Jsx => "javascript".to_string(),
+        Language::Tsx => "typescript".to_string(),
+        lang => format!("{:?}", lang).to_lowercase(),
+    }
 }

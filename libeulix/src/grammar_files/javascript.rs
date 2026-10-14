@@ -1,6 +1,7 @@
 // Copyright 2025-2026 Dawood K. (Nurysso)
 // SPDX-License-Identifier: Apache-2.0
 
+use super::react::{jsx_component_name, unwrap_component_wrapper};
 use super::utils::{extract_todos, static_regex};
 
 use crate::struc::kb_struct::*;
@@ -473,6 +474,8 @@ impl JsParser {
     fn parse_var_bound_function(&self, declarator: &Node) -> Option<Function> {
         let name_node = declarator.child_by_field_name("name")?;
         let value = declarator.child_by_field_name("value")?;
+        // `const X = memo(() => ...)` / `forwardRef((props, ref) => ...)`
+        let value = unwrap_component_wrapper(value, self.source_code.as_bytes());
         if value.kind() != "arrow_function" && value.kind() != "function_expression" {
             return None;
         }
@@ -695,6 +698,21 @@ impl JsParser {
             "try_statement" => "try",
             _ => context,
         };
+        // `<Child />` renders Child: record it as a call so component trees
+        // show up in the call graph.
+        if let Some(callee) = jsx_component_name(node, self.source_code.as_bytes()) {
+            let key = format!("{}:{}", callee, node.start_position().row);
+            if seen.insert(key) {
+                calls.push(FunctionCall {
+                    callee,
+                    defined_in: None,
+                    line: node.start_position().row + 1,
+                    args: vec![],
+                    is_conditional: context != "unconditional",
+                    context: context.to_string(),
+                });
+            }
+        }
         if node.kind() == "call_expression" || node.kind() == "new_expression" {
             if let Some(func_node) = node.child_by_field_name("function") {
                 let callee = self.resolve_callee(&func_node);
@@ -898,6 +916,11 @@ impl JsParser {
     }
 
     fn find_call_names(&self, node: &Node, calls: &mut Vec<String>, seen: &mut HashSet<String>) {
+        if let Some(name) = jsx_component_name(node, self.source_code.as_bytes()) {
+            if seen.insert(name.clone()) {
+                calls.push(name);
+            }
+        }
         let mut cursor = node.walk();
         if node.kind() == "call_expression" {
             if let Some(func_node) = node.child_by_field_name("function") {
@@ -1180,6 +1203,8 @@ impl JsParser {
                     if child.kind() == "variable_declarator" {
                         if let Some(value) = child.child_by_field_name("value") {
                             // skip functions - those are captured as Function entries
+                            let value =
+                                unwrap_component_wrapper(value, self.source_code.as_bytes());
                             if value.kind() == "arrow_function"
                                 || value.kind() == "function_expression"
                             {
@@ -1501,4 +1526,77 @@ pub fn parse_file(path: &Path) -> Result<(String, FileData), String> {
     let source_code = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
     parse_source(path, &source_code)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used)]
+
+    use super::*;
+
+    fn parse_jsx(src: &str) -> FileData {
+        let (_, fd) = crate::grammar_files::parse_source(Path::new("web/App.jsx"), src)
+            .expect("parse should succeed");
+        fd
+    }
+
+    fn find_fn<'a>(fd: &'a FileData, name: &str) -> &'a Function {
+        #[allow(clippy::panic)]
+        fd.functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function `{}` not found", name))
+    }
+
+    fn callees(f: &Function) -> Vec<&str> {
+        f.calls.iter().map(|c| c.callee.as_str()).collect()
+    }
+
+    // .jsx goes through the JavaScript grammar (which parses JSX) instead
+    // of being rejected as unsupported.
+    #[test]
+    fn jsx_file_is_parsed_as_javascript() {
+        let fd = parse_jsx("export default function App() { return <Layout><Nav /></Layout>; }\n");
+        assert_eq!(fd.language, "javascript");
+        assert!(fd.syntax.is_clean(), "syntax: {:?}", fd.syntax);
+        let app = find_fn(&fd, "App");
+        let names = callees(app);
+        assert_eq!(
+            names.iter().filter(|c| **c == "Layout").count(),
+            1,
+            "{:?}",
+            names
+        );
+        assert!(names.contains(&"Nav"), "{:?}", names);
+    }
+
+    // DOM tags are not calls; member tags keep their qualifier.
+    #[test]
+    fn jsx_dom_tags_skipped_member_tags_kept() {
+        let fd = parse_jsx(
+            "const List = ({ items }) => <ul>{items.map(i => <Menu.Item key={i} />)}</ul>;\n",
+        );
+        let names = callees(find_fn(&fd, "List"));
+        assert!(names.contains(&"Menu.Item"), "{:?}", names);
+        assert!(!names.contains(&"ul"), "{:?}", names);
+    }
+
+    // memo()/forwardRef() wrapped components are Functions, not globals.
+    #[test]
+    fn wrapped_components_are_functions() {
+        let fd = parse_jsx(
+            "import { memo, forwardRef } from 'react';\n\
+             export const Row = memo((props) => <Cell {...props} />);\n\
+             const Input = forwardRef(function Input(props, ref) { return <input ref={ref} />; });\n\
+             function Cell() { return null; }\n",
+        );
+        assert!(callees(find_fn(&fd, "Row")).contains(&"Cell"));
+        find_fn(&fd, "Input");
+        let globals: Vec<&str> = fd.global_vars.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            !globals.contains(&"Row") && !globals.contains(&"Input"),
+            "{:?}",
+            globals
+        );
+    }
 }

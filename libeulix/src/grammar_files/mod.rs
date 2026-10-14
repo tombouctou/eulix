@@ -8,6 +8,7 @@ pub mod java;
 pub mod javascript;
 pub mod language;
 pub mod python;
+pub mod react;
 pub mod rust;
 pub mod typescript;
 pub mod utils;
@@ -21,8 +22,10 @@ pub fn parse_source(path: &Path, src: &str) -> Result<(String, FileData), String
         Language::C => c::parse_source(path, src),
         Language::Cpp => cpp::parse_source(path, src),
         Language::Python => python::parse_source(path, src),
-        Language::JavaScript => javascript::parse_source(path, src),
+        // tree-sitter-javascript parses JSX natively.
+        Language::JavaScript | Language::Jsx => javascript::parse_source(path, src),
         Language::TypeScript => typescript::parse_source(path, src),
+        Language::Tsx => typescript::parse_tsx_source(path, src),
         Language::Go => go::parse_source(path, src),
         Language::Rust => rust::parse_source(path, src),
         Language::Java => java::parse_source(path, src),
