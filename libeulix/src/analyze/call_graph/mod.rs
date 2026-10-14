@@ -210,4 +210,49 @@ mod tests {
             "v2's `seen` set collapses repeated calls to the same callee into one edge"
         );
     }
+
+    fn lang_filedata(language: &str, functions: Vec<Function>) -> FileData {
+        FileData {
+            language: language.to_string(),
+            functions,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v2_never_resolves_a_bare_name_into_another_language() {
+        // A polyglot monorepo: `items.find()` in a .tsx component is recorded
+        // as `find`; the only `find` in the project is a Python test helper.
+        // Without a language guard the project-wide tier picks it.
+        let mut structure = HashMap::new();
+        structure.insert(
+            "web/list.tsx".to_string(),
+            lang_filedata(
+                "typescript",
+                vec![func("func_List::web/list.tsx", "List", vec!["find", "Row"])],
+            ),
+        );
+        structure.insert(
+            "web/row.tsx".to_string(),
+            lang_filedata(
+                "typescript",
+                vec![func("func_Row::web/row.tsx", "Row", vec![])],
+            ),
+        );
+        structure.insert(
+            "tests/test_search.py".to_string(),
+            lang_filedata(
+                "python",
+                vec![func("func_find::tests/test_search.py", "find", vec![])],
+            ),
+        );
+        let g = build_call_graph_v2(&structure);
+        let targets: Vec<&str> = g
+            .edges
+            .iter()
+            .filter(|e| e.from == "func_List::web/list.tsx")
+            .map(|e| e.to.as_str())
+            .collect();
+        assert_eq!(targets, vec!["func_Row::web/row.tsx"]);
+    }
 }

@@ -209,6 +209,23 @@ fn is_self_qualifier(q: &str) -> bool {
 /// Number of leading path components `a` and `b` share (byte-aligned to `/`).
 /// Used as a cheap "closeness" heuristic: a candidate in a nearby directory
 /// is a better guess than one on the other side of the tree.
+/// Language family of a file, from `FileData.language`. A name can only
+/// resolve to a symbol of the same family: in a polyglot repo a TypeScript
+/// `list.find()` must not land on a Python `def find`. 0 = unknown, which
+/// matches anything (keeps hand-built test fixtures and new languages
+/// working).
+fn language_family(language: &str) -> u8 {
+    match language {
+        "python" => 1,
+        "typescript" | "javascript" | "tsx" | "jsx" => 2,
+        "go" => 3,
+        "rust" => 4,
+        "java" => 5,
+        "c" | "cpp" => 6,
+        _ => 0,
+    }
+}
+
 fn common_dir_prefix(a: &str, b: &str) -> usize {
     let (a, b) = (clean_path(a).as_bytes(), clean_path(b).as_bytes());
     let (mut last_slash, mut i) = (0, 0);
@@ -370,6 +387,8 @@ struct Resolver<'a> {
     files: &'a [&'a str],
     /// file idx -> dir id; non-decreasing because files are sorted by (dir, path)
     file_dir: &'a [u32],
+    /// file idx -> language family (see `language_family`)
+    file_family: &'a [u8],
     imports: &'a [FileImports<'a>],
     /// (class idx, method name, method idx), sorted — enables binary search
     /// for "does this class define this method".
@@ -396,8 +415,13 @@ impl<'a> Resolver<'a> {
     ) -> (Option<u32>, usize) {
         let mut best: Option<(u8, Reverse<usize>, u32)> = None;
         let mut eligible = 0usize;
+        let fam = self.file_family[file as usize];
         for c in cands {
             let n = &self.nodes[c as usize];
+            let cfam = self.file_family[n.file as usize];
+            if fam != 0 && cfam != 0 && fam != cfam {
+                continue;
+            }
             let Some(r) = rank(want, n.kind, strict) else {
                 continue;
             };
@@ -632,6 +656,10 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
         structure.iter().map(|(k, v)| (k.as_str(), v)).collect();
     files.sort_unstable_by(|a, b| (dir_of(a.0), a.0).cmp(&(dir_of(b.0), b.0)));
     let paths: Vec<&str> = files.iter().map(|f| f.0).collect();
+    let file_family: Vec<u8> = files
+        .iter()
+        .map(|f| language_family(&f.1.language))
+        .collect();
     let mut file_dir: Vec<u32> = Vec::with_capacity(paths.len());
     {
         let (mut prev, mut id) = (None::<&str>, 0u32);
@@ -753,6 +781,7 @@ pub fn build_with(structure: &HashMap<String, FileData>, opts: &CallGraphOptions
         by_name: &by_name,
         files: &paths,
         file_dir: &file_dir,
+        file_family: &file_family,
         imports: &imports,
         methods: &methods,
         parents: Map::new(),
