@@ -156,7 +156,7 @@ define BUILD_GO_VARIANT_CMD
 		OUT_FILE="$(BUILD_DIR)/eulix_$(1)_$(3)$(if $(filter windows,$(1)),.exe,)"; \
 	fi; \
 	cd $(CLI_DIR) && GOOS=$(1) GOARCH=$(2) CGO_ENABLED=0 go build \
-		-ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=$${REQ_FILE}' -X 'eulix/internal/assets.embeddedParserHash=$${PARSER_HASH}'" \
+		-ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=$${REQ_FILE}' -X 'eulix/internal/assets.ParserHash=$${PARSER_HASH}'" \
 		-trimpath -o ../$${OUT_FILE} ./cmd/eulix/main.go; \
 	$(ECHO) "$(GREEN)✓ Built $${OUT_FILE}$(NC)"
 endef
