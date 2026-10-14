@@ -64,7 +64,9 @@ mod platform {
     }
 }
 
+// No-op stubs mirror the Linux API; the callers of some are Linux-only.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 mod platform {
     use std::fs::File;
     use std::os::unix::io::AsRawFd;

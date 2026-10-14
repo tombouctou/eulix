@@ -1455,7 +1455,14 @@ export function f(items: string[]) {
         );
         assert_eq!(
             callees(find_fn(&fd, "f")),
-            vec!["items.find", "api.cases.list", "this.save", "().then", "load", "plain"]
+            vec![
+                "items.find",
+                "api.cases.list",
+                "this.save",
+                "().then",
+                "load",
+                "plain"
+            ]
         );
     }
 
