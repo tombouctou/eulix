@@ -90,6 +90,11 @@ pub struct Import {
     /// `import * as ns from "m"` -> `ns`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// Modifiers of the import statement itself, as written. C#: `global`
+    /// (`global using X;` applies to every file of the project) and
+    /// `static` (`using static X.C;` binds the static members of `C`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -387,6 +392,8 @@ pub struct LanguageSpecificInfo {
     pub cpp: Option<Box<CppInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub java: Option<Box<JavaInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csharp: Option<Box<CSharpInfo>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -569,6 +576,42 @@ pub struct JavaInfo {
     pub uses_try_with_resources: bool,
     pub uses_reflection: bool,
 }
+/// C#-specific metadata for a type or a member.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CSharpInfo {
+    /// Enclosing namespace (`namespace A.B;` or `namespace A.B { }`);
+    /// `None` for the global namespace.
+    pub namespace: Option<String>,
+    /// Namespace-qualified name of a type, nested types joined by `.`:
+    /// `Pm.Api.Services.IssueSearch.Hit`. All parts of a `partial` type
+    /// share it, which is what PRISM v2 merges them by.
+    pub full_name: Option<String>,
+    /// Types: "class" | "record" | "record_struct" | "struct" | "interface" |
+    /// "enum" | "delegate". Members: "method" | "constructor" | "property".
+    pub kind: String,
+    pub access_modifier: Option<String>,
+    /// Every other modifier as written: static, abstract, sealed, partial,
+    /// async, override, virtual, readonly, ...
+    pub modifiers: Vec<String>,
+    /// Attributes as written, one per attribute: `[HttpGet("{id}")]`.
+    pub attributes: Vec<String>,
+    pub generic_params: Vec<String>,
+    pub is_partial: bool,
+    pub is_static: bool,
+    /// `static T F(this X x)`: callable as `x.F()`.
+    pub is_extension: bool,
+    /// A constructor synthesised from a primary constructor
+    /// (`class C(IFoo foo)`, `record R(int X)`).
+    pub is_primary_constructor: bool,
+    /// `[Fact]`, `[Theory]`, `[Test]`, `[TestMethod]`, `[TestCase]`.
+    pub is_test: bool,
+    /// ASP.NET route: the controller's `[Route]` joined with the action's
+    /// `[HttpGet("...")]` / `[Route]` template, `[controller]` left as is.
+    pub route: Option<String>,
+    pub http_methods: Vec<String>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CInfo {
     pub is_static: bool, // file-scoped linkage

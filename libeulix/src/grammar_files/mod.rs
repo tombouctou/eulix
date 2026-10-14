@@ -3,6 +3,7 @@
 
 pub mod c;
 pub mod cpp;
+pub mod csharp;
 pub mod go;
 pub mod java;
 pub mod javascript;
@@ -21,6 +22,7 @@ pub fn parse_source(path: &Path, src: &str) -> Result<(String, FileData), String
     match Language::detect(path) {
         Language::C => c::parse_source(path, src),
         Language::Cpp => cpp::parse_source(path, src),
+        Language::CSharp => csharp::parse_source(path, src),
         Language::Python => python::parse_source(path, src),
         // tree-sitter-javascript parses JSX natively.
         Language::JavaScript | Language::Jsx => javascript::parse_source(path, src),

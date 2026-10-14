@@ -7,6 +7,7 @@ use std::path::Path;
 pub enum Language {
     C,
     Cpp,
+    CSharp,
     Go,
     Java,
     JavaScript,
@@ -63,6 +64,11 @@ static LANG_TABLE: &[LangSpec] = &[
     LangSpec {
         lang: Language::Java,
         extensions: &["java"],
+        filenames: &[],
+    },
+    LangSpec {
+        lang: Language::CSharp,
+        extensions: &["cs"],
         filenames: &[],
     },
     LangSpec {
@@ -162,6 +168,7 @@ mod tests {
         assert_eq!(Language::from_extension("java"), Some(Language::Java));
         assert_eq!(Language::from_extension("c"), Some(Language::C));
         assert_eq!(Language::from_extension("h"), Some(Language::C));
+        assert_eq!(Language::from_extension("cs"), Some(Language::CSharp));
 
         // C++
         assert_eq!(Language::from_extension("cpp"), Some(Language::Cpp));

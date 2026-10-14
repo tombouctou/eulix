@@ -237,7 +237,7 @@ pub struct ParseFailure(pub String);
 // and falls through to `Err("Unsupported language: …")`. They're excluded
 // here so the server never offers features it can't back up.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "h++", "c++", "go", "java", "js", "mjs", "cjs",
+    "c", "h", "cpp", "cc", "cxx", "hpp", "hxx", "h++", "c++", "cs", "go", "java", "js", "mjs", "cjs",
     "py", "pyw", "pyi", "rs", "ts", "mts", "cts",
 ];
 
@@ -252,6 +252,7 @@ pub fn detect_language(path: &Path) -> &'static str {
     match Language::detect(path) {
         Language::C => "c",
         Language::Cpp => "cpp",
+        Language::CSharp => "csharp",
         Language::Go => "go",
         Language::Java => "java",
         Language::JavaScript => "javascript",

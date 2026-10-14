@@ -81,6 +81,7 @@ pub fn collect_source_files_and_hash(
             Language::Go,
             Language::Rust,
             Language::Java,
+            Language::CSharp,
         ]
     } else {
         languages
@@ -95,6 +96,7 @@ pub fn collect_source_files_and_hash(
                 "javascript" | "js" => vec![Language::JavaScript, Language::Jsx],
                 "jsx" => vec![Language::Jsx],
                 "java" => vec![Language::Java],
+                "csharp" | "cs" | "c#" => vec![Language::CSharp],
                 "typescript" | "ts" => vec![Language::TypeScript, Language::Tsx],
                 "tsx" => vec![Language::Tsx],
                 "go" | "golang" => vec![Language::Go],
