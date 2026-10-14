@@ -335,7 +335,9 @@ func (cb *ContextBuilder) loadAndIndexCallGraph() {
 	for _, e := range cg.Edges {
 		// An ambiguous edge is one of several guesses for the same call:
 		// it would pull unrelated code into the context.
-		if e.EdgeType != "call" || e.Resolution == "ambiguous" {
+		// A dispatch edge (interface method -> implementation) is followed
+		// like a call: a call through the interface may run the target.
+		if (e.EdgeType != "call" && e.EdgeType != "dispatch") || e.Resolution == "ambiguous" {
 			continue
 		}
 		cb.callGraph[e.From] = append(cb.callGraph[e.From],

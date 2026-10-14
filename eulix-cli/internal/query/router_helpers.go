@@ -717,22 +717,26 @@ func (r *Router) resolveCallGraphEntity(name string) (string, *utils.CallGraphNo
 func BuildCallGraphIndex(ref *utils.CallGraphRef) *retrieval.CallGraphIdx {
 	if ref == nil {
 		return &retrieval.CallGraphIdx{
-			Nodes:        make(map[string]*utils.CallGraphNode),
-			CalledBy:     make(map[string][]string),
-			Calls:        make(map[string][]string),
-			CalledByName: make(map[string][]string),
-			CallsByName:  make(map[string][]string),
-			Candidates:   make(map[[2]string][]string),
+			Nodes:         make(map[string]*utils.CallGraphNode),
+			CalledBy:      make(map[string][]string),
+			Calls:         make(map[string][]string),
+			CalledByName:  make(map[string][]string),
+			CallsByName:   make(map[string][]string),
+			Candidates:    make(map[[2]string][]string),
+			ImplementedBy: make(map[string][]string),
+			Implements:    make(map[string][]string),
 		}
 	}
 
 	idx := &retrieval.CallGraphIdx{
-		Nodes:        make(map[string]*utils.CallGraphNode, len(ref.Nodes)),
-		CalledBy:     make(map[string][]string, len(ref.Nodes)),
-		Calls:        make(map[string][]string, len(ref.Nodes)),
-		CalledByName: make(map[string][]string),
-		CallsByName:  make(map[string][]string),
-		Candidates:   make(map[[2]string][]string),
+		Nodes:         make(map[string]*utils.CallGraphNode, len(ref.Nodes)),
+		CalledBy:      make(map[string][]string, len(ref.Nodes)),
+		Calls:         make(map[string][]string, len(ref.Nodes)),
+		CalledByName:  make(map[string][]string),
+		CallsByName:   make(map[string][]string),
+		Candidates:    make(map[[2]string][]string),
+		ImplementedBy: make(map[string][]string),
+		Implements:    make(map[string][]string),
 	}
 
 	for i := range ref.Nodes {
@@ -747,6 +751,11 @@ func BuildCallGraphIndex(ref *utils.CallGraphRef) *retrieval.CallGraphIdx {
 	sites := map[site][]string{}
 	for i := range ref.Edges {
 		e := &ref.Edges[i]
+		if e.EdgeType == "dispatch" {
+			idx.ImplementedBy[e.From] = append(idx.ImplementedBy[e.From], e.To)
+			idx.Implements[e.To] = append(idx.Implements[e.To], e.From)
+			continue
+		}
 		if e.EdgeType != "call" {
 			continue
 		}
@@ -768,7 +777,7 @@ func BuildCallGraphIndex(ref *utils.CallGraphRef) *retrieval.CallGraphIdx {
 			idx.Candidates[key] = dedupStrings(append(idx.Candidates[key], tos...))
 		}
 	}
-	for _, m := range []map[string][]string{idx.CalledBy, idx.Calls, idx.CalledByName, idx.CallsByName} {
+	for _, m := range []map[string][]string{idx.CalledBy, idx.Calls, idx.CalledByName, idx.CallsByName, idx.ImplementedBy, idx.Implements} {
 		for id, v := range m {
 			m[id] = dedupStrings(v)
 		}

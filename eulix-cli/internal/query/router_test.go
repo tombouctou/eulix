@@ -1136,6 +1136,64 @@ func TestHandleCallGraph(t *testing.T) {
 			t.Errorf("got:\n%s\nwant:\n%s", got, want)
 		}
 	})
+	t.Run("callers through an interface are a group of their own", func(t *testing.T) {
+		const (
+			iPut    = "method_IStore_PutAsync::IStore.cs"
+			s3Put   = "method_S3Store_PutAsync::S3Store.cs"
+			filePut = "method_FileStore_PutAsync::FileStore.cs"
+		)
+		r := newRouter(t)
+		r.setGraph(t, M{
+			"Nodes": S{
+				node(iPut, "IStore.cs", "method", 1),
+				node(s3Put, "S3Store.cs", "method", 1),
+				node(filePut, "FileStore.cs", "method", 0),
+				node("method_Blobs_WriteAsync::Blobs.cs", "Blobs.cs", "method", 0),
+				node("method_S3Tests_Puts::S3Tests.cs", "S3Tests.cs", "method", 0),
+				node("method_Seeder_Seed::Seeder.cs", "Seeder.cs", "method", 0),
+			},
+			"Edges": S{
+				resolvedEdge("method_Blobs_WriteAsync::Blobs.cs", iPut, "package", 3),
+				resolvedEdge("method_Seeder_Seed::Seeder.cs", iPut, "name", 8),
+				resolvedEdge("method_S3Tests_Puts::S3Tests.cs", s3Put, "import", 5),
+				M{"From": iPut, "To": s3Put, "EdgeType": "dispatch", "CallSiteLine": 4},
+				M{"From": iPut, "To": filePut, "EdgeType": "dispatch", "CallSiteLine": 9},
+			},
+		})
+		got, _ := r.handleCallGraph("", cls(classifier.QueryTypeCallGraph, "S3Store.PutAsync"))
+		want := lines(
+			"Call Graph: S3Store.PutAsync",
+			"  File    : S3Store.cs",
+			"  Type    : method",
+			"  Metrics : Fan-in 1 | Fan-out 0 | through an interface: 2",
+			"",
+			"┌── Called by (Inbound):",
+			"│   ← S3Tests.Puts",
+			"├── Called through IStore.PutAsync  (IStore.cs), which may run 1 other implementation(s) too:",
+			"│   ⇠ Blobs.WriteAsync  (Blobs.cs)",
+			"│   ? Seeder.Seed  (Seeder.cs, by name) — only definition with this name",
+			"└── Calls (Outbound):",
+			"    (none — leaf function)",
+		)
+		if got != want {
+			t.Errorf("got:\n%s\nwant:\n%s", got, want)
+		}
+		// No direct caller: the interface callers are the answer.
+		got, _ = r.handleCallGraph("", cls(classifier.QueryTypeCallGraph, "FileStore.PutAsync"))
+		if !strings.Contains(got, "(none by name — see the calls through the interface below)") ||
+			!strings.Contains(got, "⇠ Blobs.WriteAsync") {
+			t.Errorf("got:\n%s", got)
+		}
+		// The interface method lists what a call to it may run.
+		got, _ = r.handleCallGraph("", cls(classifier.QueryTypeCallGraph, "IStore.PutAsync"))
+		if !strings.Contains(got, lines(
+			"├── Implemented / overridden by (a call here may run them):",
+			"│   ⇢ S3Store.PutAsync  (S3Store.cs)",
+			"│   ⇢ FileStore.PutAsync  (FileStore.cs)",
+		)) {
+			t.Errorf("got:\n%s", got)
+		}
+	})
 	t.Run("concurrent use is race-free and consistent", func(t *testing.T) {
 		r := callGraphFixture(t)
 		want := map[string]string{}

@@ -426,6 +426,11 @@ func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
 	callees := r.cgBuild.Calls[key]
 	guessedCallers := r.cgBuild.CalledByName[key]
 	guessedCallees := r.cgBuild.CallsByName[key]
+	bases := r.dispatchBases(key)
+	through := 0
+	for _, base := range bases {
+		through += len(r.cgBuild.CalledBy[base]) + len(r.cgBuild.CalledByName[base])
+	}
 
 	var b strings.Builder
 	b.Grow(2048)
@@ -440,11 +445,16 @@ func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
 	if len(guessedCallers)+len(guessedCallees) > 0 {
 		fmt.Fprintf(&b, " | by name only: %d in, %d out", len(guessedCallers), len(guessedCallees))
 	}
+	if through > 0 {
+		fmt.Fprintf(&b, " | through an interface: %d", through)
+	}
 	b.WriteString("\n")
 
 	b.WriteString("\n┌── Called by (Inbound):\n")
 	if len(callers) == 0 {
-		if len(guessedCallers) == 0 {
+		if through > 0 && len(guessedCallers) == 0 {
+			b.WriteString("│   (none by name — see the calls through the interface below)\n")
+		} else if len(guessedCallers) == 0 {
 			b.WriteString("│   (none — likely an entry point or exported API)\n")
 		} else {
 			b.WriteString("│   (none tied by an import or the same file)\n")
@@ -464,6 +474,7 @@ func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
 				r.candidateNote(callerID, key))
 		}
 	}
+	r.writeDispatch(&b, key, bases)
 
 	b.WriteString("└── Calls (Outbound):\n")
 	if len(callees) == 0 {
@@ -490,6 +501,61 @@ func (r *Router) callGraphBody(key string, node *utils.CallGraphNode) string {
 	r.cgIdx.cache[key] = body
 	r.cgIdx.mu.Unlock()
 	return body
+}
+
+// maxDispatchUp bounds the walk from an implementation up through the
+// methods it implements or overrides (interface <- abstract <- override).
+const maxDispatchUp = 16
+
+// dispatchBases returns the interface / base methods `key` implements or
+// overrides, nearest first, transitively: a call to any of them may run
+// `key`.
+func (r *Router) dispatchBases(key string) []string {
+	var out []string
+	seen := map[string]bool{key: true}
+	queue := append([]string(nil), r.cgBuild.Implements[key]...)
+	for len(queue) > 0 && len(out) < maxDispatchUp {
+		k := queue[0]
+		queue = queue[1:]
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+		queue = append(queue, r.cgBuild.Implements[k]...)
+	}
+	return out
+}
+
+// writeDispatch adds to a "who calls" answer the callers that reach `key`
+// through an interface or a base type — they name the interface method,
+// and the call may as well run another implementation — and, for an
+// interface / base method, the implementations a call to it may run.
+func (r *Router) writeDispatch(b *strings.Builder, key string, bases []string) {
+	for _, base := range bases {
+		callers := r.cgBuild.CalledBy[base]
+		guessed := r.cgBuild.CalledByName[base]
+		fmt.Fprintf(b, "├── Called through %s  (%s)", bareID(base), r.fileOf(base))
+		if others := len(r.cgBuild.ImplementedBy[base]) - 1; others > 0 {
+			fmt.Fprintf(b, ", which may run %d other implementation(s) too", others)
+		}
+		b.WriteString(":\n")
+		if len(callers)+len(guessed) == 0 {
+			b.WriteString("│   (no callers)\n")
+		}
+		for _, c := range callers {
+			fmt.Fprintf(b, "│   ⇠ %s  (%s)\n", bareID(c), r.fileOf(c))
+		}
+		for _, c := range guessed {
+			fmt.Fprintf(b, "│   ? %s  (%s, by name)%s\n", bareID(c), r.fileOf(c), r.candidateNote(c, base))
+		}
+	}
+	if impls := r.cgBuild.ImplementedBy[key]; len(impls) > 0 {
+		b.WriteString("├── Implemented / overridden by (a call here may run them):\n")
+		for _, m := range impls {
+			fmt.Fprintf(b, "│   ⇢ %s  (%s)\n", bareID(m), r.fileOf(m))
+		}
+	}
 }
 
 func (r *Router) fileOf(id string) string {

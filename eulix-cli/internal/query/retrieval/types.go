@@ -36,6 +36,11 @@ type CallGraphIdx struct {
 	// For an ambiguous edge {from, to}: every target the same call site may
 	// mean, `to` included.
 	Candidates map[[2]string][]string
+	// Dispatch edges: an interface / abstract / virtual method -> the
+	// methods of subtypes implementing or overriding it, and back. A call
+	// to the former may run any of the latter.
+	ImplementedBy map[string][]string
+	Implements    map[string][]string
 }
 
 type FunctionNode struct {
