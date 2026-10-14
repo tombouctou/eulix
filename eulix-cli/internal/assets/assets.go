@@ -224,13 +224,10 @@ func combinedHash(name string, parts []FileHash) FileHash {
 	}
 }
 
-// eulixRoot returns $HOME/.Eulix without creating or checking it.
+// EulixRoot returns the global eulix directory ($EULIX_HOME, or
+// $HOME/.Eulix) without creating or checking it.
 func EulixRoot() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("could not determine home directory: %w", err)
-	}
-	return filepath.Join(homeDir, utils.EulixGlobalDir), nil
+	return utils.GlobalRoot()
 }
 
 // ExtractAll unpacks embedded binaries and scripts to $HOME/.Eulix idempotently.
@@ -616,13 +613,13 @@ func InstallEmbedDeps(root string) error {
 }
 
 func IsInitialized() bool {
-	homeDir, err := os.UserHomeDir()
+	root, err := utils.GlobalRoot()
 	if err != nil {
-		log.Printf("warning: failed to get user home dir: %v", err)
+		log.Printf("warning: failed to locate eulix root: %v", err)
 		return false
 	}
 
-	initializedFile := filepath.Join(homeDir, ".Eulix", ".initialized")
+	initializedFile := filepath.Join(root, ".initialized")
 
 	_, err = os.Stat(initializedFile)
 	if err == nil {

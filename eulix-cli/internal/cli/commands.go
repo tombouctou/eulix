@@ -140,12 +140,12 @@ var vizEulizeCMD = &cobra.Command{
 	Short: "Opens web application to view call graphs",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		home, err := os.UserHomeDir()
+		root, err := utils.GlobalRoot()
 		if err != nil {
-			return fmt.Errorf("could not determine home directory: %w", err)
+			return err
 		}
 
-		htmlPath := filepath.Join(home, utils.EulixGlobalDir, "bin", "vizeulize.html")
+		htmlPath := filepath.Join(root, utils.ParserSubDir, "vizeulize.html")
 		if _, err := os.Stat(htmlPath); err != nil {
 			return fmt.Errorf("could not find vizeulize.html at %s: %w", htmlPath, err)
 		}
@@ -218,11 +218,11 @@ var versionCMD = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Printf("%s: %s\n", utils.AppName, utils.AppVersion)
 
-		homeDir, err := os.UserHomeDir()
+		root, err := utils.GlobalRoot()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "eulix_parser: [Error] failed to get user home directory: %v\n", err)
+			fmt.Fprintf(os.Stderr, "eulix_parser: [Error] %v\n", err)
 		} else {
-			parserPath := filepath.Join(homeDir, ".Eulix", "bin", "eulix_parser")
+			parserPath := filepath.Join(root, utils.ParserSubDir, "eulix_parser")
 			if output, err := runSubCommand(parserPath, "--version"); err != nil {
 				fmt.Fprintf(os.Stderr, "eulix_parser: [Error] %v\n", err)
 			} else {

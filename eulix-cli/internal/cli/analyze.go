@@ -54,9 +54,9 @@ func analyzeProject(projectPath string) error {
 		return nil
 	}
 
-	homeDir, err := os.UserHomeDir()
+	globalRoot, err := utils.GlobalRoot()
 	if err != nil {
-		return fmt.Errorf("cannot determine home directory: %w", err)
+		return err
 	}
 	eulixDir := filepath.Join(projectPath, utils.EulixDir)
 
@@ -89,7 +89,7 @@ func analyzeProject(projectPath string) error {
 	fmt.Println("✓ Parser completed")
 
 	fmt.Println("Generating embeddings...")
-	venvPath := filepath.Join(homeDir, ".Eulix", ".venv")
+	venvPath := filepath.Join(globalRoot, utils.VenvSubDir)
 	pythonPath, venvEnv, err := embeddings.GetVenvPython(venvPath)
 	if err != nil {
 		return fmt.Errorf("virtual environment setup failed: %w", err)
@@ -98,7 +98,7 @@ func analyzeProject(projectPath string) error {
 		fmt.Printf("Using Python venv: %s (interpreter: %s)\n", venvPath, pythonPath)
 	}
 
-	embedScriptPath := filepath.Join(homeDir, ".Eulix", "eulix_embed", "main.py")
+	embedScriptPath := filepath.Join(globalRoot, utils.ScriptsSubDir, "main.py")
 	if _, err := os.Stat(embedScriptPath); os.IsNotExist(err) {
 		return fmt.Errorf("embed script not found: %s", embedScriptPath)
 	}

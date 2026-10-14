@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"eulix/internal/utils"
 )
 
 // venvPythonCandidates returns the platform-correct interpreter paths inside a venv.
@@ -88,17 +90,17 @@ func GetVenvPython(venvPath string) (string, []string, error) {
 // interpreter from the canonical venv at ~/.Eulix/.venv.
 // Used only when config.Project.Embedis == "script".
 func FindEulixEmbed() (scriptPath, pythonPath string, venvEnv []string, err error) {
-	homeDir, err := os.UserHomeDir()
+	root, err := utils.GlobalRoot()
 	if err != nil {
-		return "", "", nil, fmt.Errorf("cannot determine home directory: %w", err)
+		return "", "", nil, err
 	}
 
-	script := filepath.Join(homeDir, ".Eulix", "eulix_embed", "main.py")
+	script := filepath.Join(root, utils.ScriptsSubDir, "main.py")
 	if _, err := os.Stat(script); err != nil {
 		return "", "", nil, fmt.Errorf("eulix_embed script not found (expected at %s)", script)
 	}
 
-	venvPath := filepath.Join(homeDir, ".Eulix", ".venv")
+	venvPath := filepath.Join(root, utils.VenvSubDir)
 	python, env, err := GetVenvPython(venvPath)
 	if err != nil {
 		return "", "", nil, fmt.Errorf("found embed script but no usable Python: %w", err)
