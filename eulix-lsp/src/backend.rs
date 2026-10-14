@@ -101,8 +101,7 @@ impl Backend {
         let range = self
             .state
             .text_for_uri(&uri)
-            .map(|(rope, _)| position::find_name_on_line(&rope, def.line_start, &def.name))
-            .flatten()
+            .and_then(|(rope, _)| position::find_name_on_line(&rope, def.line_start, &def.name))
             .unwrap_or_else(|| line_range(def.line_start));
         Some(Location { uri, range })
     }
@@ -368,11 +367,11 @@ impl LanguageServer for Backend {
 
         let token_types: Vec<SemanticTokenType> = convert::TOKEN_TYPES
             .iter()
-            .map(|s| SemanticTokenType::new(*s))
+            .map(|s| SemanticTokenType::new(s))
             .collect();
         let token_modifiers: Vec<SemanticTokenModifier> = convert::TOKEN_MODIFIERS
             .iter()
-            .map(|s| SemanticTokenModifier::new(*s))
+            .map(|s| SemanticTokenModifier::new(s))
             .collect();
 
         Ok(InitializeResult {

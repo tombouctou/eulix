@@ -135,7 +135,7 @@ pub async fn parse_all(
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 // Report every 64 files so progress updates don't dominate
                 // the scan itself.
-                if n % 64 == 0 || n == total {
+                if n.is_multiple_of(64) || n == total {
                     on_progress(n);
                 }
             }

@@ -521,12 +521,12 @@ mod tests {
         // This is the case that used to brick a buffer: a parse must either
         // give symbols or give an error, never "succeeded with nothing".
         let parsed = parse(Path::new("m.py"), "def good():\n    pass\ndef ((( :\n");
-        match parsed {
-            Ok(p) => assert!(
+        // An explicit error is also acceptable.
+        if let Ok(p) = parsed {
+            assert!(
                 p.functions.iter().any(|f| f.name == "good"),
                 "recovered parse should still expose `good`"
-            ),
-            Err(_) => {} // an explicit error is also acceptable
+            );
         }
     }
 

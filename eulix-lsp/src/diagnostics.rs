@@ -108,7 +108,6 @@ pub fn diagnostics_for(
             }
         }
     }
-    let mut dupes = dupes;
     dupes.sort_unstable();
     dupes.dedup();
     for (name, line, kind) in dupes {

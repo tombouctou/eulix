@@ -45,7 +45,7 @@ pub fn position_to_char(rope: &Rope, pos: Position) -> Option<usize> {
 
 // char index to LSP Position.
 pub fn char_to_position(rope: &Rope, char_idx: usize) -> Position {
-    let char_idx = char_idx.min(rope.len_chars().saturating_sub(1).max(0));
+    let char_idx = char_idx.min(rope.len_chars().saturating_sub(1));
     if rope.len_chars() == 0 {
         return Position::new(0, 0);
     }
@@ -73,7 +73,7 @@ pub fn chars_to_range(rope: &Rope, start: usize, end: usize) -> Range {
 // Full extent of a 1-based line, clamped to the real line so the `character`
 // never exceeds what the line actually holds.
 pub fn full_line_range(rope: &Rope, line_1based: usize) -> Range {
-    let line = line_1based.saturating_sub(1) as usize;
+    let line = line_1based.saturating_sub(1);
     if rope.len_chars() == 0 {
         return Range::new(Position::new(0, 0), Position::new(0, 0));
     }
@@ -143,7 +143,7 @@ pub fn find_name_on_line(rope: &Rope, line_1based: usize, name: &str) -> Option<
     if name.is_empty() {
         return None;
     }
-    let line = line_1based.saturating_sub(1) as usize;
+    let line = line_1based.saturating_sub(1);
     if line >= rope.len_lines() {
         return None;
     }
@@ -155,9 +155,7 @@ pub fn find_name_on_line(rope: &Rope, line_1based: usize, name: &str) -> Option<
     let needle = name.as_bytes();
     let mut from = 0usize;
     while from + needle.len() <= bytes.len() {
-        let Some(rel) = text[from..].find(name) else {
-            return None;
-        };
+        let rel = text[from..].find(name)?;
         let start = from + rel;
         let end = start + needle.len();
         let before_ok = start == 0 || !is_ident_char(prev_char(&text, start));
